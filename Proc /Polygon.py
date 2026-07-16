@@ -112,9 +112,9 @@ lat_grid[az_sub - az_min, rg_sub - rg_min] = lat_sub
 
 
 def rc_to_lonlat(row, col):
-'''
-clip to valid index range (shapes() can return a corner one past the last row/col) then round to the nearest actual cell before looking up its real coordinates
-'''
+    '''
+    clip to valid index range (shapes() can return a corner one past the last row/col) then round to the nearest actual cell before looking up its real coordinates
+    '''
     r = int(round(np.clip(row, 0, n_az - 1)))
     c = int(round(np.clip(col, 0, n_rg - 1)))
     return lon_grid[r, c], lat_grid[r, c]
@@ -150,11 +150,25 @@ for geom, val in shapes(final_grid, mask=final_grid > 0, connectivity=8):
 # turn the list of records into a geospatial table; EPSG:4326 = standard WGS84 lat/lon
 gdf = gpd.GeoDataFrame(records, crs="EPSG:4326")
 
-# write out as a shapefile (creates .shp, .shx, .dbf, .prj alongside it)
-gdf.to_file("water_intertidal_polygons.shp")
+# repair any self-intersecting polygons (can happen once pixel-grid coords are stretched onto real lon/lat) so union/dissolve below doesn't choke on them
+gdf["geometry"] = gdf["geometry"].buffer(0)
 
-print(f"Wrote {len(gdf)} polygons "
-      f"({(gdf['category'] == 'water').sum()} water, "
-      f"{(gdf['category'] == 'intertidal').sum()} intertidal).")
+# merge every polygon that shares the same category into a single (multi)polygon, so each category ends up as exactly one feature
+gdf = gdf.dissolve(by="category", as_index=False)
+gdf = gdf[["category", "geometry"]]
+gdf["cent_lon"] = gdf.geometry.centroid.x
+gdf["cent_lat"] = gdf.geometry.centroid.y
 
+# split the dissolved table into its two categories so each can be written to its own shapefile
+water_gdf = gdf[gdf["category"] == "water"]
+intertidal_gdf = gdf[gdf["category"] == "intertidal"]
+
+# write out water as its own shapefile 
+water_gdf.to_file("water_polygon.shp")
+
+# write out intertidal as its own shapefile 
+intertidal_gdf.to_file("intertidal_polygon.shp")
+
+print(f"Wrote {len(water_gdf)} water polygon(s) to water_polygon.shp")
+print(f"Wrote {len(intertidal_gdf)} intertidal polygon(s) to intertidal_polygon.shp")
 
