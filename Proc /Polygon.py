@@ -24,7 +24,7 @@ geolocation_qual_sub = data.geolocation_qual.values[mask]
 lat_sub = data.latitude.values[mask]
 lon_sub = data.longitude.values[mask]
 
-Water = {4, 5, 7}         
+water = {4, 5, 7}         
 intertidal = {2, 3, 6}   
 land = {1}               
 
