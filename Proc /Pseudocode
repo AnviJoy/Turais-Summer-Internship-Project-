@@ -1,0 +1,141 @@
+1. Read / import Level 2 SWOT data
+
+- Read `L2_HR_PIXC` (pixel cloud) for the region and cycles of interest.
+- Variables needed: height, σ_phase_noise,
+  dh/dφ, geolocation_qual (Q_geo), classification,
+  latitude, longitude, azimuth_index, range_index.
+
+
+2. Compute height anomaly (per cycle)
+
+- Choose a reference open water point, a location that is always open
+  water and never intertidal, for the region of interest. Identify it by
+  cycle-wise visual inspection of height.
+- Select the nearest `L2_HR_PIXC` pixel to that point with Q_geo == 0.
+- Compute the median height within a 0.001° buffer around that pixel.
+- Subtract this median from every other pixel's height in the region 
+  (height anomaly, h_a).
+- h_a has a consistent, characteristic pattern over open water
+  but a distinctly different one over non water pixels, generally producing
+  a bimodal distribution once an intertidal zone is present.
+
+
+3. Filter with σ_phase_noise threshold (per cycle)
+
+- Remove any pixel with σ_phase_noise above a user defined threshold
+  (paper uses ≈0.08 radian, refined per site).
+- This mostly strips out land pixels (land/land near water medians exceed
+  approximatly 0.2 rad; open water/water near land medians are typically <0.05 rad).
+- Initial threshold estimate: median σ_phase_noise across all cycles in the
+  region, then tuned empirically.
+
+
+4. Filter open-water pixels via the height anomaly PDF (per cycle)
+
+- On the remaining σ_phase_noise filtered pixels, compute a Gaussian
+  KDE-based PDF of h_a (PDF(h_a)) with an adaptively sized bin count
+  (fixed bin width ≈ 5 cm).
+- Identify peaks with density ≥ 0.1:
+  - Low tide will have two distinct peaks
+  - Mid tide will have two overlapping but distinguishable peaks
+  - High tide will have a single peak
+- Assume the first peak, h_a peak, is open water (may include a small
+  fraction of inland water, negligible at low tide).
+- Upper cutoff `h_a^upper`: first `h_a > h_a^peak` where `PDF(h_a)`
+  drops to ≤ 1% of the peak's density (ε_up).
+- Lower cutoff `h_a^lower` (separates open water from non-open-water):
+  - Case A — multiple minima in `PDF'(h_a)` within `[h_a^peak, h_a^upper]`
+    (typical low/mid tide): find the largest-magnitude minimum
+    `h_a^min` and the next local minimum `h_a^next`; set
+    `ε_low = |PDF'(h_a^min)| / 50`; take the first `h_a` in
+    `[h_a^min, h_a^next]` where `|PDF'(h_a)| ≤ ε_low`, avoiding the
+    non-open-water peak position. If it lands on that peak, shrink the
+    search interval and repeat.
+  - Case B — single minimum in `PDF'(h_a)` (typical high tide): find
+    the peak of `PDF''(h_a)` at `h_a^{peak,PDF''}` for `h_a > h_a^min`;
+    set `ε_low = min(PDF'(h_a)) / 50` for `h_a > h_a^{peak,PDF''}`; take
+    the first `h_a` beyond that point where `|PDF'(h_a)| ≤ ε_low`.
+  - In either case, if `h_a^lower ≥ h_a^upper`, double ε_low and repeat
+    until `h_a^lower < h_a^upper`.
+- Retain only pixels with `h_a` outside `[h_a^lower, h_a^upper]` on the
+  open-water side (i.e., `h_a < h_a^lower`) as excluded open water; pixels
+  within `[h_a^lower, h_a^upper]` are the candidate non-open-water set
+  (intertidal + land).
+
+
+5a. Build the water extent mask (once per region, using all cycles)
+
+- Create a regular high-resolution grid over the region (e.g., 0.0001°).
+- For each available SWOT cycle, build a per-cycle validity grid: cell =
+  count of pixels passing the σ_phase_noise threshold (Step 3) within that
+  cell.
+- Stack and sum validity grids across all cycles.
+- Keep only cells above a user-defined quantile of total validity (e.g.,
+  90%; lower, e.g. 75%, for geomorphologically complex sites).
+- Delineate outlines of the resulting high-validity clusters (buffer
+  operation); keep only the largest-area polygon (assumed = open
+  water/intertidal extent).
+- Clean the polygon: drop small holes below an area/perimeter threshold
+  (likely noise, not real islands); smooth with a moving average.
+- This produces the water extent mask, computed once and reused for
+  every cycle.
+
+5b. Apply the water extent mask (per cycle)
+
+- Take the candidate non-open-water pixels from Step 4.
+- Discard any pixel falling outside the water extent mask (these are
+  inland/land pixels, not intertidal).
+- Remaining pixels = final classified intertidal pixels for that cycle.
+
+
+
+6. (Optional) Quality-control refinements
+
+Several known failure modes worth guarding against:
+- Reference point accidentally falling in a dark water pixel, biases the
+  whole anomaly PDF; check its classification before using it.
+- dark water pixels elsewhere in open ocean can create a spurious third
+  PDF peak; consider filtering classification == dark water pixels, but
+  cautiously (SWOT's own dark-water flag can misfire in dynamic coasts).
+- Large ROIs spanning significant tidal/geoid gradients can bias the PDF;
+  either shrink the ROI, remove the gradient from `height` first, or use
+  multiple sub-zone reference points.
+- Missing/unreliable Δh_xover_cor for a cycle, exclude that cycle (see
+  Step 0).
+
+
+
+7. Estimate per-pixel height uncertainty
+
+For each retained intertidal pixel:
+
+σ_h = |dh/dφ| × σ_phase_noise
+
+
+8. Aggregate intertidal pixels into a topography grid
+
+- Define an output grid (paper uses ≈0.00025°, ~20 m).
+- For each output grid cell containing n intertidal pixels with heights
+  h = [h_1, ..., h_n] and uncertainties σ_h = [σ_h1, ..., σ_hn], run a
+  Monte Carlo median aggregation (chosen over plain median or weighted
+  mean for robustness to outliers + uncertainty-awareness):
+  - For i = 1...L realizations: perturb each pixel height with Gaussian
+    noise scaled by its own σ_h, take the median of that perturbed set 
+    M_i.
+  - Final cell height = median of all M_i.
+  - 95% confidence interval = the [α, 1−α] quantiles of the sorted `M_i`.
+- (Optional) Multi-cycle stacking: repeat aggregation combining pixels
+  from multiple low/mid-tide cycles (paper uses 8 low + 8 mid tide cycles)
+  to reduce single-cycle interferometric noise — stacked results show
+  markedly lower RMSE than single-cycle in the paper's validation.
+
+
+9. (Optional) Validate output
+- Re-grid a reference DEM (e.g., LiDAR) onto the same output grid.
+- Compute per-cell height differences (SWOT − reference).
+- Report mean/median bias, standard deviation, RMSE — optionally stratified
+  by bottom type or local slope, since the paper finds degraded accuracy
+  over rocky/steep terrain (layover effects).
+
+
+
