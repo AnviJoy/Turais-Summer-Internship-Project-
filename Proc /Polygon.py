@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import xarray as xr
 from skimage.morphology import remove_small_objects, binary_closing, disk
@@ -8,6 +9,14 @@ import geopandas as gpd
 
 # path to the SWOT L2 HR PIXC (pixel cloud) NetCDF file
 file = r"C:\Users\pmalesza\Documents\Python Codes\SWOT_L2_HR_PIXC_052_475_245R_20260706T065928_20260706T065939_PID0_01.nc"
+
+# base folder all outputs go into, plus a subfolder named after the numbers/tags
+output_base = r"C:\Users\pmalesza\Documents\SWOT_L2_HR_PIXC Output Polygons"
+file_stem = os.path.splitext(os.path.basename(file))[0]
+prefix = "SWOT_L2_HR_PIXC_"
+subfolder_name = file_stem[len(prefix):] if file_stem.startswith(prefix) else file_stem
+output_dir = os.path.join(output_base, subfolder_name)
+os.makedirs(output_dir, exist_ok=True)
 
 # open just the "pixel_cloud" group, which holds one row per detected pixel
 data = xr.open_dataset(file, group="pixel_cloud")
@@ -163,12 +172,12 @@ gdf["cent_lat"] = gdf.geometry.centroid.y
 water_gdf = gdf[gdf["category"] == "water"]
 intertidal_gdf = gdf[gdf["category"] == "intertidal"]
 
-# write out water as its own shapefile 
-water_gdf.to_file("water_polygon.shp")
+# write out water as its own shapefile, into this run's output_dir
+water_gdf.to_file(os.path.join(output_dir, "water_polygon.shp"))
 
-# write out intertidal as its own shapefile 
-intertidal_gdf.to_file("intertidal_polygon.shp")
+# write out intertidal as its own shapefile, into this run's output_dir
+intertidal_gdf.to_file(os.path.join(output_dir, "intertidal_polygon.shp"))
 
-print(f"Wrote {len(water_gdf)} water polygon(s) to water_polygon.shp")
-print(f"Wrote {len(intertidal_gdf)} intertidal polygon(s) to intertidal_polygon.shp")
+print(f"Wrote {len(water_gdf)} water polygon(s) to {os.path.join(output_dir, 'water_polygon.shp')}")
+print(f"Wrote {len(intertidal_gdf)} intertidal polygon(s) to {os.path.join(output_dir, 'intertidal_polygon.shp')}")
 
