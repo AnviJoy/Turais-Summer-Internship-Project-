@@ -11,30 +11,30 @@ from scipy import stats
 
 @dataclass
 class SWOTPipelineConfig:
-    """Tunable parameters, defaults taken from the pseudocode / paper."""
+    """Tunable thresholds for the pipeline, defaults from the paper's pseudocode."""
 
-    sigma_phase_noise_threshold: float = 0.08          
-    ref_point_buffer_deg: float = 0.001                 
-    pdf_bin_width_m: float = 0.05                       
-    pdf_peak_min_density: float = 0.10                   
-    eps_up_fraction: float = 0.01                        
-    eps_low_divisor: float = 50.0                        
-    mask_grid_res_deg: float = 0.0001                    
-    mask_validity_quantile: float = 0.90                 
-    output_grid_res_deg: float = 0.00025                 
-    mc_realizations: int = 1000                          
-    mc_ci_alpha: float = 0.025                            
-    exclude_dark_water: bool = False                     
-    min_hole_area_deg2: float = 1e-8                     
-    smoothing_window: int = 5                             
+    sigma_phase_noise_threshold: float = 0.08
+    ref_point_buffer_deg: float = 0.001
+    pdf_bin_width_m: float = 0.05
+    pdf_peak_min_density: float = 0.10
+    eps_up_fraction: float = 0.01
+    eps_low_divisor: float = 50.0
+    mask_grid_res_deg: float = 0.0001
+    mask_validity_quantile: float = 0.90
+    output_grid_res_deg: float = 0.00025
+    mc_realizations: int = 1000
+    mc_ci_alpha: float = 0.025
+    exclude_dark_water: bool = False
+    min_hole_area_deg2: float = 1e-8
+    smoothing_window: int = 5
 
     fill_value_threshold: float = 1e30
 
-    # These are placeholders; confirm against the PDD/ATBD classification
+    # Placeholders — confirm against the PDD/ATBD classification table.
     open_water_class_codes: tuple = (3, 4)
     dark_water_class_codes: tuple = (5, 6)
 
-    # Variable name aliases for reading L2_HR_PIXC granules 
+    # Variable name aliases for reading L2_HR_PIXC granules.
     pixc_var_aliases: dict = field(default_factory=lambda: {
         "height": ["height"],
         "sigma_phase_noise": ["phase_noise_std", "sigma_phase_noise", "phase_noise_sigma"],
@@ -47,7 +47,7 @@ class SWOTPipelineConfig:
         "range_index": ["range_index", "rg_index"],
     })
 
-    # Optional variables: read if present, but a missing one only warns
+    # Optional variables: read if present, otherwise just warn.
     pixc_optional_var_aliases: dict = field(default_factory=lambda: {
         "height_cor_xover": ["height_cor_xover"],
         "geoid": ["geoid"],
@@ -58,62 +58,18 @@ class SWOTPipelineConfig:
 
 
 class SWOTIntertidalPipeline:
-    """
-    End-to-end SWOT L2_HR_PIXC -> intertidal topography pipeline. Works on
-    any L2_HR_PIXC granule you read in via `read_pixel_cloud` — there is
-    nothing site- or dataset-specific baked into the class; all region/tide
-    behavior comes from the config thresholds and the ref_lat/ref_lon you
-    pass in.
-
-    Typical usage
-    -------------
-    >>> cfg = SWOTPipelineConfig(sigma_phase_noise_threshold=0.08)
-    >>> pipe = SWOTIntertidalPipeline(cfg)
-    >>> pixc = pipe.read_pixel_cloud("cycle012.nc", cycle=12)
-    >>> pixc = pipe.compute_height_anomaly(pixc, ref_lat=..., ref_lon=...)
-    >>> pixc_f = pipe.filter_phase_noise(pixc)
-    >>> candidates = pipe.filter_open_water(pixc_f)
-    ...
-    >>> mask = pipe.build_water_extent_mask(list_of_per_cycle_pixc_f)
-    >>> intertidal = pipe.apply_water_extent_mask(candidates, mask)
-    >>> intertidal = pipe.estimate_pixel_uncertainty(intertidal)
-    >>> grid = pipe.aggregate_to_grid(intertidal)
-    >>> stats_df = pipe.validate_against_dem(grid, "reference_dem.tif")
-    """
+    """SWOT L2_HR_PIXC to intertidal topography pipeline, following the paper's method."""
 
     def __init__(self, config: Optional[SWOTPipelineConfig] = None):
+        """Store the config (or defaults) and reset the cached water extent mask."""
         self.cfg = config or SWOTPipelineConfig()
-        self._water_extent_mask = None  
+        self._water_extent_mask = None
 
     def read_pixel_cloud(self, filepath: str, cycle: Optional[int] = None,
                           bbox: Optional[tuple] = None,
                           group: Optional[str] = None,
                           extra_var_aliases: Optional[dict] = None) -> pd.DataFrame:
-        """
-        Read *any* SWOT L2_HR_PIXC granule and return a flat DataFrame with
-        the standard variables needed downstream: height, sigma_phase_noise,
-        dh_dphi, geolocation_qual, classification, latitude, longitude,
-        azimuth_index, range_index, plus a 'cycle' column (if provided).
-
-        This is written against the L2_HR_PIXC variable *set*, not against
-        any single product version's exact variable names — see
-        `SWOTPipelineConfig.pixc_var_aliases` for the name variants it
-        already knows about. Every other method in this class only ever
-        touches the resulting standard column names, so once a granule is
-        read in here, the rest of the pipeline is file-format-agnostic.
-
-        Parameters
-        ----------
-        filepath : path to the L2_HR_PIXC NetCDF granule.
-        cycle : optional SWOT cycle number, stamped onto every row.
-        bbox : optional (lon_min, lon_max, lat_min, lat_max) to subset the
-               region of interest at read time.
-        group : NetCDF group holding the pixel cloud variables. If None,
-                tries 'pixel_cloud' first, then falls back to the root group.
-        extra_var_aliases : optional dict of {standard_name: [extra source
-                names]} to merge on top of `self.cfg.pixc_var_aliases`, for
-                one-off product versions that use a name not already known.
-        """
+        """Read an L2_HR_PIXC granule into a flat DataFrame with standardized columns."""
         try:
             import xarray as xr
         except ImportError as e:
@@ -174,17 +130,17 @@ class SWOTIntertidalPipeline:
         return df
 
     def _mask_fill_values(self, arr: np.ndarray) -> np.ndarray:
-        """Convert netCDF sentinel fill values (huge magnitude) to NaN."""
+        """Replace netCDF fill-value sentinels with NaN."""
         arr = np.asarray(arr)
         if not np.issubdtype(arr.dtype, np.floating):
-            return arr  
+            return arr
         arr = arr.astype(float, copy=True)
         arr[np.abs(arr) >= self.cfg.fill_value_threshold] = np.nan
         return arr
 
     @staticmethod
     def _open_pixc_group(xr, filepath: str, group: Optional[str]):
-        """Open the pixel_cloud group, auto-detecting if not specified."""
+        """Open the granule's pixel_cloud group, auto-detecting if not given."""
         if group is not None:
             return xr.open_dataset(filepath, group=group)
         try:
@@ -197,15 +153,10 @@ class SWOTIntertidalPipeline:
                 except (OSError, KeyError, ValueError):
                     continue
             return root
-          
 
     def cycle_has_reliable_xover(self, pixc_df: pd.DataFrame,
                                   max_missing_frac: float = 0.5) -> bool:
-        """
-        Step 6 QC helper: returns False if `height_cor_xover` is absent, or
-        missing/NaN for more than `max_missing_frac` of pixels — signal to
-        exclude this cycle per the pseudocode's Step 6 note.
-        """
+        """Return False if height_cor_xover is absent or mostly missing for this cycle."""
         if "height_cor_xover" not in pixc_df.columns:
             warnings.warn("height_cor_xover not present in this granule; "
                            "cannot evaluate crossover-correction reliability.")
@@ -213,18 +164,10 @@ class SWOTIntertidalPipeline:
         missing_frac = pixc_df["height_cor_xover"].isna().mean()
         return missing_frac <= max_missing_frac
 
-  
     def compute_height_anomaly(self, pixc_df: pd.DataFrame,
                                 ref_lat: float, ref_lon: float,
                                 buffer_deg: Optional[float] = None) -> pd.DataFrame:
-        """
-        Subtract the local open-water reference median height from every
-        pixel's height, producing 'h_a' (height anomaly).
-
-        The reference pixel is the nearest Q_geo == 0 pixel to
-        (ref_lat, ref_lon); the reference value is the median height of all
-        pixels within `buffer_deg` of that pixel.
-        """
+        """Subtract the local open-water reference height, adding column 'h_a'."""
         buffer_deg = buffer_deg or self.cfg.ref_point_buffer_deg
         df = pixc_df.copy()
 
@@ -262,39 +205,26 @@ class SWOTIntertidalPipeline:
         return df
 
     def _open_water_class_codes(self) -> Sequence[int]:
-        """
-        SWOT PIXC classification codes treated as open water.
-
-        UNVERIFIED DEFAULT — see `SWOTPipelineConfig.open_water_class_codes`.
-        Confirm against your product version's classification code table
-        before relying on this for anything beyond a rough sanity check.
-        """
+        """Return the configured open-water classification codes (unverified default)."""
         return self.cfg.open_water_class_codes
-      
 
     def _dark_water_class_codes(self) -> Sequence[int]:
-        """UNVERIFIED DEFAULT — see `SWOTPipelineConfig.dark_water_class_codes`."""
+        """Return the configured dark-water classification codes (unverified default)."""
         return self.cfg.dark_water_class_codes
 
-  
     def filter_phase_noise(self, pixc_df: pd.DataFrame,
                             threshold: Optional[float] = None) -> pd.DataFrame:
-        """Remove pixels with sigma_phase_noise above `threshold`."""
+        """Drop pixels with sigma_phase_noise above `threshold`."""
         threshold = threshold if threshold is not None \
             else self.cfg.sigma_phase_noise_threshold
         return pixc_df[pixc_df["sigma_phase_noise"] <= threshold].reset_index(drop=True)
-                              
 
     def estimate_phase_noise_threshold(self, pixc_df: pd.DataFrame) -> float:
-        """
-        Initial threshold estimate: median sigma_phase_noise across all
-        pixels/cycles in the region (to be tuned empirically afterward).
-        """
+        """Return the median sigma_phase_noise as a starting threshold estimate."""
         return float(pixc_df["sigma_phase_noise"].median())
 
-
     def _kde_pdf(self, h_a: np.ndarray, bin_width: Optional[float] = None):
-        """Gaussian-KDE PDF of h_a, evaluated on an adaptively sized grid."""
+        """Compute a Gaussian-KDE PDF of h_a over an evenly spaced grid."""
         bin_width = bin_width or self.cfg.pdf_bin_width_m
         h_a = h_a[~np.isnan(h_a)]
         if h_a.size < 2:
@@ -309,19 +239,18 @@ class SWOTIntertidalPipeline:
 
     def find_pdf_peaks(self, grid: np.ndarray, pdf: np.ndarray,
                         min_density: Optional[float] = None) -> np.ndarray:
-        """Indices of local maxima in PDF(h_a) with density >= min_density."""
+        """Return indices of PDF local maxima with density >= min_density."""
         from scipy.signal import argrelextrema
         min_density = min_density if min_density is not None \
             else self.cfg.pdf_peak_min_density
 
         maxima_idx = argrelextrema(pdf, np.greater_equal, order=1)[0]
         maxima_idx = maxima_idx[pdf[maxima_idx] >= min_density]
-        # de-duplicate plateaus
         return np.unique(maxima_idx)
 
     def compute_upper_cutoff(self, grid: np.ndarray, pdf: np.ndarray,
                               peak_idx: int, eps_up_fraction: Optional[float] = None) -> float:
-        """h_a^upper: first h_a > h_a^peak where PDF drops to <= eps_up * peak density."""
+        """Return h_a where the PDF first drops to eps_up_fraction of the peak density."""
         eps_up_fraction = eps_up_fraction if eps_up_fraction is not None \
             else self.cfg.eps_up_fraction
         peak_density = pdf[peak_idx]
@@ -330,14 +259,11 @@ class SWOTIntertidalPipeline:
         for i in range(peak_idx, len(pdf)):
             if pdf[i] <= threshold:
                 return float(grid[i])
-        return float(grid[-1])  
+        return float(grid[-1])
 
     def compute_lower_cutoff(self, grid: np.ndarray, pdf: np.ndarray,
                               peak_idx: int, upper_cutoff: float) -> float:
-        """
-        h_a^lower per Step 4, Case A (multiple minima of PDF') or Case B
-        (single minimum of PDF').
-        """
+        """Return the h_a cutoff separating open water from non-open-water (Step 4 Case A/B)."""
         dpdf = np.gradient(pdf, grid)
         d2pdf = np.gradient(dpdf, grid)
 
@@ -373,7 +299,6 @@ class SWOTIntertidalPipeline:
                 if candidate_idx is not None:
                     h_a_lower = grid[candidate_idx]
                 else:
-                    # shrink interval and retry
                     search_hi = max(search_lo + 1, search_hi - 1)
                     attempts += 1
             if h_a_lower is None:
@@ -417,13 +342,7 @@ class SWOTIntertidalPipeline:
         return float(h_a_lower)
 
     def filter_open_water(self, pixc_df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Run the full Step-4 PDF analysis on a (already phase-noise-filtered)
-        pixel DataFrame and return the candidate non-open-water pixels
-        (intertidal + land), i.e. those with h_a in [h_a_lower, h_a_upper].
-
-        Adds diagnostic attrs: grid, pdf, peak_idx, h_a_lower, h_a_upper.
-        """
+        """Return candidate non-open-water pixels (h_a within the Step 4 cutoffs)."""
         h_a = pixc_df["h_a"].to_numpy()
         grid, pdf, _ = self._kde_pdf(h_a)
 
@@ -431,7 +350,7 @@ class SWOTIntertidalPipeline:
         if peaks_idx.size == 0:
             raise ValueError("No PDF peaks found >= min_density; "
                               "check pdf_peak_min_density / data quality.")
-        peak_idx = int(peaks_idx[0])  
+        peak_idx = int(peaks_idx[0])
 
         h_a_upper = self.compute_upper_cutoff(grid, pdf, peak_idx)
         h_a_lower = self.compute_lower_cutoff(grid, pdf, peak_idx, h_a_upper)
@@ -444,18 +363,10 @@ class SWOTIntertidalPipeline:
         })
         return candidates
 
-
     def build_water_extent_mask(self, per_cycle_filtered_pixc: Sequence[pd.DataFrame],
                                  grid_res_deg: Optional[float] = None,
                                  validity_quantile: Optional[float] = None):
-        """
-        per_cycle_filtered_pixc: list of DataFrames, one per cycle, each
-        already passed through `filter_phase_noise` (Step 3 output — NOT
-        the Step-4 candidates).
-
-        Returns a shapely Polygon (largest-area, cleaned) representing the
-        open water / intertidal extent, and caches it on `self`.
-        """
+        """Build and cache the region's water extent polygon from per-cycle pixel validity."""
         try:
             from shapely.geometry import Polygon, MultiPolygon
             from shapely.ops import unary_union
@@ -515,7 +426,7 @@ class SWOTIntertidalPipeline:
         return cleaned
 
     def _clean_polygon(self, polygon):
-        """Drop small holes (likely noise) and lightly smooth the boundary."""
+        """Drop small holes and lightly smooth a polygon's boundary."""
         from shapely.geometry import Polygon
 
         min_hole_area = self.cfg.min_hole_area_deg2
@@ -539,11 +450,7 @@ class SWOTIntertidalPipeline:
 
     def apply_water_extent_mask(self, candidates_df: pd.DataFrame,
                                  mask_polygon=None) -> pd.DataFrame:
-        """
-        Discard candidate non-open-water pixels (Step 4 output) that fall
-        outside the water extent mask (Step 5a). Remaining pixels are the
-        final classified intertidal pixels for that cycle.
-        """
+        """Keep only candidate pixels that fall inside the water extent mask."""
         try:
             from shapely.geometry import Point
             from shapely import vectorized
@@ -569,9 +476,8 @@ class SWOTIntertidalPipeline:
 
         return df[inside].reset_index(drop=True)
 
-
     def check_reference_point_classification(self, pixc_df: pd.DataFrame) -> bool:
-        """Warn if the cached reference pixel is classified as dark water."""
+        """Warn if the cached reference pixel looks like dark water."""
         ref_latlon = pixc_df.attrs.get("ref_pixel_latlon")
         if ref_latlon is None:
             warnings.warn("No reference pixel recorded on this DataFrame.")
@@ -589,7 +495,7 @@ class SWOTIntertidalPipeline:
 
     def filter_dark_water(self, pixc_df: pd.DataFrame,
                            enabled: Optional[bool] = None) -> pd.DataFrame:
-        """Optionally drop classification == dark_water pixels (use cautiously)."""
+        """Optionally drop pixels classified as dark water."""
         enabled = self.cfg.exclude_dark_water if enabled is None else enabled
         if not enabled:
             return pixc_df
@@ -598,13 +504,7 @@ class SWOTIntertidalPipeline:
 
     def remove_regional_gradient(self, pixc_df: pd.DataFrame,
                                   gradient_model=None) -> pd.DataFrame:
-        """
-        Remove a large-scale tidal/geoid gradient from 'height' before
-        computing h_a, for ROIs spanning significant gradients.
-
-        gradient_model: callable(lat, lon) -> predicted height offset.
-        If None, fits a simple planar (lat, lon) linear trend to height.
-        """
+        """Subtract a fitted (or given) large-scale height gradient before computing anomalies."""
         df = pixc_df.copy()
         if gradient_model is None:
             A = np.column_stack([
@@ -617,23 +517,17 @@ class SWOTIntertidalPipeline:
         df["height"] = df["height"] - gradient_model(df["latitude"], df["longitude"])
         return df
 
-  
     def estimate_pixel_uncertainty(self, intertidal_df: pd.DataFrame) -> pd.DataFrame:
-        """sigma_h = |dh/dphi| * sigma_phase_noise, added as column 'sigma_h'."""
+        """Add sigma_h = |dh_dphi| * sigma_phase_noise to each pixel."""
         df = intertidal_df.copy()
         df["sigma_h"] = df["dh_dphi"].abs() * df["sigma_phase_noise"]
         return df
 
-   
     def monte_carlo_median(self, heights: np.ndarray, sigmas: np.ndarray,
                             n_realizations: Optional[int] = None,
                             alpha: Optional[float] = None,
                             rng: Optional[np.random.Generator] = None):
-        """
-        Perturb pixel heights with Gaussian noise scaled by their own
-        sigma_h, take the median each realization, then summarize across
-        realizations with a median + [alpha, 1-alpha] CI.
-        """
+        """Return a Monte Carlo median height and [alpha, 1-alpha] confidence interval."""
         n_realizations = n_realizations or self.cfg.mc_realizations
         alpha = alpha if alpha is not None else self.cfg.mc_ci_alpha
         rng = rng or np.random.default_rng()
@@ -646,7 +540,7 @@ class SWOTIntertidalPipeline:
 
         noise = rng.normal(loc=0.0, scale=sigmas, size=(n_realizations, n))
         perturbed = heights[None, :] + noise
-        M = np.median(perturbed, axis=1)  
+        M = np.median(perturbed, axis=1)
 
         final_height = float(np.median(M))
         M_sorted = np.sort(M)
@@ -657,13 +551,7 @@ class SWOTIntertidalPipeline:
     def aggregate_to_grid(self, intertidal_df: pd.DataFrame,
                            grid_res_deg: Optional[float] = None,
                            rng: Optional[np.random.Generator] = None) -> pd.DataFrame:
-        """
-        Bin intertidal pixels (with 'height' and 'sigma_h') into an output
-        grid and Monte-Carlo-median-aggregate each cell.
-
-        Returns a DataFrame with one row per non-empty cell: cell_lat,
-        cell_lon, n_pixels, height, ci_low, ci_high.
-        """
+        """Aggregate intertidal pixels into grid cells via Monte Carlo median."""
         grid_res_deg = grid_res_deg or self.cfg.output_grid_res_deg
         df = intertidal_df.copy()
 
@@ -689,23 +577,13 @@ class SWOTIntertidalPipeline:
     def stack_multi_cycle(self, intertidal_dfs: Sequence[pd.DataFrame],
                            grid_res_deg: Optional[float] = None,
                            rng: Optional[np.random.Generator] = None) -> pd.DataFrame:
-        """
-        Optional multi-cycle stacking: concatenate intertidal pixels from
-        several low/mid-tide cycles before aggregating, to reduce
-        single-cycle interferometric noise.
-        """
+        """Pool pixels from multiple cycles and aggregate them into one grid."""
         combined = pd.concat(intertidal_dfs, ignore_index=True)
         return self.aggregate_to_grid(combined, grid_res_deg=grid_res_deg, rng=rng)
 
-  
     def validate_against_dem(self, grid_df: pd.DataFrame, dem_path: str,
                               stratify_by: Optional[str] = None) -> pd.DataFrame:
-        """
-        Re-grid a reference DEM (e.g. LiDAR) onto the same output-grid
-        cells as `grid_df`, compute per-cell (SWOT - reference) height
-        differences, and report bias / std / RMSE, optionally stratified
-        by a column in `grid_df` (e.g. bottom type or local slope class).
-        """
+        """Compare gridded heights to a reference DEM and report bias/std/RMSE."""
         try:
             import rasterio
             from rasterio.transform import rowcol
@@ -735,6 +613,7 @@ class SWOTIntertidalPipeline:
         df = df.dropna(subset=["diff"])
 
         def _summary(sub: pd.DataFrame) -> pd.Series:
+            """Return bias/std/RMSE summary stats for a subset of cells."""
             return pd.Series({
                 "mean_bias": sub["diff"].mean(),
                 "median_bias": sub["diff"].median(),
@@ -754,12 +633,7 @@ class SWOTIntertidalPipeline:
     def run_pipeline(self, filepaths_by_cycle: dict, ref_lat: float, ref_lon: float,
                       bbox: Optional[tuple] = None,
                       dem_path: Optional[str] = None) -> dict:
-        """
-        Convenience end-to-end runner over multiple cycles.
-
-        filepaths_by_cycle: {cycle_number: pixc_filepath}
-        Returns a dict with intermediate and final products for inspection.
-        """
+        """Run the full pipeline across cycles and return intermediate and final products."""
         per_cycle_filtered = {}
         per_cycle_intertidal = {}
 
@@ -772,7 +646,7 @@ class SWOTIntertidalPipeline:
             per_cycle_filtered[cycle] = filtered
 
             candidates = self.filter_open_water(filtered)
-            per_cycle_intertidal[cycle] = candidates  # mask applied after mask is built
+            per_cycle_intertidal[cycle] = candidates
 
         mask = self.build_water_extent_mask(list(per_cycle_filtered.values()))
 
