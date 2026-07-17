@@ -121,9 +121,9 @@ lat_grid[az_sub - az_min, rg_sub - rg_min] = lat_sub
 
 
 def rc_to_lonlat(row, col):
-    '''
+    """
     clip to valid index range (shapes() can return a corner one past the last row/col) then round to the nearest actual cell before looking up its real coordinates
-    '''
+    """
     r = int(round(np.clip(row, 0, n_az - 1)))
     c = int(round(np.clip(col, 0, n_rg - 1)))
     return lon_grid[r, c], lat_grid[r, c]
