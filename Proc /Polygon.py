@@ -1,21 +1,23 @@
+
 import os
 import numpy as np
 import xarray as xr
+import geopandas as gpd
+from shapely.geometry import MultiPoint
 from skimage.morphology import remove_small_objects, binary_closing, disk
 from scipy.ndimage import binary_fill_holes
-from rasterio.features import shapes
-from shapely.geometry import shape
-import geopandas as gpd
+from scipy.ndimage import label
+import matplotlib.pyplot as plt
 
 # path to the SWOT L2 HR PIXC (pixel cloud) NetCDF file
 file = r"C:\Users\pmalesza\Documents\Python Codes\SWOT_L2_HR_PIXC_052_475_245R_20260706T065928_20260706T065939_PID0_01.nc"
+output_base = r"C:\Users\pmalesza\Documents\SWOT_L2_HR_PIXC Output Polygons"
 
 # base folder all outputs go into, plus a subfolder named after the numbers/tags
-output_base = r"C:\Users\pmalesza\Documents\SWOT_L2_HR_PIXC Output Polygons"
-file_stem = os.path.splitext(os.path.basename(file))[0]
+stem = os.path.splitext(os.path.basename(file))[0]
 prefix = "SWOT_L2_HR_PIXC_"
-subfolder_name = file_stem[len(prefix):] if file_stem.startswith(prefix) else file_stem
-output_dir = os.path.join(output_base, subfolder_name)
+name = stem[len(prefix):] if stem.startswith(prefix) else stem
+output_dir = os.path.join(output_base, name)
 os.makedirs(output_dir, exist_ok=True)
 
 # open just the "pixel_cloud" group, which holds one row per detected pixel
@@ -23,161 +25,196 @@ data = xr.open_dataset(file, group="pixel_cloud")
 mask = np.ones(data.longitude.values.shape, dtype=bool)
 
 # each pixel's position in SWOT's native along-track (azimuth) / cross-track (range) grid
-az_sub = data.azimuth_index.values[mask].astype(int)
-rg_sub = data.range_index.values[mask].astype(int)
+az = data.azimuth_index.values[mask].astype(int)
+rg = data.range_index.values[mask].astype(int)
 
 # per pixel classification code and its associated quality flags
-classification_sub = data.classification.values[mask]
-classification_qual_sub = data.classification_qual.values[mask]
-interferogram_qual_sub = data.interferogram_qual.values[mask]
-sig0_qual_sub = data.sig0_qual.values[mask]
-geolocation_qual_sub = data.geolocation_qual.values[mask]
+classification = data.classification.values[mask]
+classification_qual = data.classification_qual.values[mask]
+interferogram_qual = data.interferogram_qual.values[mask]
+sig0_qual = data.sig0_qual.values[mask]
+geolocation_qual = data.geolocation_qual.values[mask]
 
 # per pixel real world position
-lat_sub = data.latitude.values[mask]
-lon_sub = data.longitude.values[mask]
+lat = data.latitude.values[mask]
+lon = data.longitude.values[mask]
 
 # which classification codes count as which category
-water = {4, 5, 7}         
-intertidal = {2, 3, 6}    
-land = {1}                
-
-# classification code and their respective labels 
-class_label_map = {
-    1: "Land",
-    2: "Land near water",
-    3: "Water near land",
-    4: "Open water",
-    5: "Dark water",
-    6: "Low coherence water near land",
-    7: "Open low coherence water",
-}
-
-# classification code assigned to broad category ("water" / "intertidal")
-category_map = {c: "water" for c in water}
-category_map.update({c: "intertidal" for c in intertidal})
+water = {4,5,7}
+intertidal = {2,3,6}
 
 # boolean array: True where a pixel is confidently classified as land
-land_sub = (
-    (classification_sub == 1)
-    & (classification_qual_sub == 0)
+land = (
+    (classification == 1)
+    & (classification_qual == 0)
 )
 
 # bounding box of the azimuth/range indices present in this data, used to size and offset the 2D grid below
-az_min, az_max = az_sub.min(), az_sub.max()
-rg_min, rg_max = rg_sub.min(), rg_sub.max()
+az_min, az_max = az.min(), az.max()
+rg_min, rg_max = rg.min(), rg.max()
 n_az = az_max - az_min + 1
 n_rg = rg_max - rg_min + 1
 
 # scatter the flat land boolean array into its proper 2D azimuth/range grid position
-land_grid = np.zeros((n_az, n_rg), dtype=bool)
-land_grid[az_sub - az_min, rg_sub - rg_min] = land_sub
+land_grid = np.zeros((n_az,n_rg),bool)
+land_grid[az-az_min,rg-rg_min]=land
 
 # marks every grid cell that actually has a pixel in it at all
 populated = np.zeros((n_az, n_rg), dtype=bool)
-populated[az_sub - az_min, rg_sub - rg_min] = True
+populated[az - az_min, rg - rg_min] = True
 
-# clean up the land mask 
+# clean up the land mask
 BW = land_grid | ~populated
 se = disk(2)
-BW1 = remove_small_objects(BW, min_size=50, connectivity=2)  
-BW2 = binary_closing(BW1, se)                                
-BW3 = binary_fill_holes(BW2)                              
+BW1 = remove_small_objects(BW, min_size=50, connectivity=2)
+BW2 = binary_closing(BW1, se)
+BW3 = binary_fill_holes(BW2)
 
 # inverse of the cleaned land mask
 not_land_clean = ~BW3
 
 # a pixel only counts as "good quality" if all four flags read 0
-quality_ok_sub = (
-    (classification_qual_sub == 0)
-    & (interferogram_qual_sub == 0)
-    & (sig0_qual_sub == 0)
-    & (geolocation_qual_sub == 0)
+quality = (
+    (classification_qual == 0)
+    & (interferogram_qual == 0)
+    & (sig0_qual == 0)
+    & (geolocation_qual == 0)
 )
 
 # scatter the raw classification codes into the same 2D grid layout
 classification_grid = np.zeros((n_az, n_rg), dtype=np.uint8)
-classification_grid[az_sub - az_min, rg_sub - rg_min] = classification_sub
+classification_grid[az - az_min, rg - rg_min] = classification
 
 # scatter the quality ok flag into the same 2D grid layout
 quality_grid = np.zeros((n_az, n_rg), dtype=bool)
-quality_grid[az_sub - az_min, rg_sub - rg_min] = quality_ok_sub
+quality_grid[az - az_min, rg - rg_min] = quality
 
-# which grid cells hold a classification code we actually want to keep (water or intertidal)
-keep_classes = water | intertidal
-is_keep_class = np.isin(classification_grid, list(keep_classes))
+# a cell survives only if: it has data, passed quality checks, isn't inside the cleaned solid land region, and is a class we want to keep
+final_mask = populated & quality_grid & not_land_clean & np.isin(classification_grid,list(water|intertidal))
 
-# a cell survives only if; it has data, passed quality checks, isn't inside the cleaned solid land region, and is a class we want to keep
-final_mask = populated & quality_grid & not_land_clean & is_keep_class
-
-# zero out everything that didn't pass final_mask, keep the classification code elsewhere
-final_grid = np.where(final_mask, classification_grid, 0).astype(np.uint8)
-
-# grids that store each cell's real longitude/latitude (NaN where no pixel exists), used to translate pixel-grid coordinates back to real-world coordinates later
+# grids that store each cell's real longitude/latitude (NaN where no pixel exists)
 lon_grid = np.full((n_az, n_rg), np.nan)
 lat_grid = np.full((n_az, n_rg), np.nan)
-lon_grid[az_sub - az_min, rg_sub - rg_min] = lon_sub
-lat_grid[az_sub - az_min, rg_sub - rg_min] = lat_sub
+lon_grid[az - az_min, rg - rg_min] = lon
+lat_grid[az - az_min, rg - rg_min] = lat
 
 
-def rc_to_lonlat(row, col):
-    """
-    clip to valid index range (shapes() can return a corner one past the last row/col) then round to the nearest actual cell before looking up its real coordinates
-    """
-    r = int(round(np.clip(row, 0, n_az - 1)))
-    c = int(round(np.clip(col, 0, n_rg - 1)))
-    return lon_grid[r, c], lat_grid[r, c]
+# create polygons from connected water/intertidal regions
+def export(category, codes):
 
+    # pixels belonging to this category
+    category_mask = final_mask & np.isin(classification_grid, list(codes))
 
-records = []
-# shapes() traces the outline of every contiguous same-valued region in final_grid, yielding (geometry, value) pairs; connectivity=8 counts diagonal neighbors as connected
-for geom, val in shapes(final_grid, mask=final_grid > 0, connectivity=8):
-    val = int(val)
-    if val == 0:
-        # skip the background region (everywhere final_mask was False)
-        continue
-    new_coords = []
-    for ring in geom["coordinates"]:
-        # geom's rings are lists of (x, y) = (col, row) vertex pairs (image convention);  rc_to_lonlat expects (row, col), hence the swap back to (y, x) here
-        new_ring = [rc_to_lonlat(y, x) for x, y in ring]
-        new_coords.append(new_ring)
-    # rebuild a real shapely polygon, now in (lon, lat) coordinates instead of pixel space
-    poly = shape({"type": geom["type"], "coordinates": new_coords})
-    centroid = poly.centroid
-    # one dict per polygon = one future row in the output shapefile's attribute table
-    records.append(
-        {
-            "classif": val,
-            "class_lbl": class_label_map[val],
-            "category": category_map[val],
-            "cent_lon": centroid.x,
-            "cent_lat": centroid.y,
-            "geometry": poly,
-        }
+    if not np.any(category_mask):
+        print(f"No {category} pixels found.")
+        return
+
+    # identify connected groups of pixels
+    labelled_array, num_features = label(
+        category_mask,
+        structure=np.ones((3,3))
     )
 
-# turn the list of records into a geospatial table; EPSG:4326 = standard WGS84 lat/lon
-gdf = gpd.GeoDataFrame(records, crs="EPSG:4326")
+    records = []
 
-# repair any self-intersecting polygons (can happen once pixel-grid coords are stretched onto real lon/lat) so union/dissolve below doesn't choke on them
-gdf["geometry"] = gdf["geometry"].buffer(0)
+    print(f"{category}: found {num_features} connected regions")
 
-# merge every polygon that shares the same category into a single (multi)polygon, so each category ends up as exactly one feature
-gdf = gdf.dissolve(by="category", as_index=False)
-gdf = gdf[["category", "geometry"]]
-gdf["cent_lon"] = gdf.geometry.centroid.x
-gdf["cent_lat"] = gdf.geometry.centroid.y
+    for region_id in range(1, num_features + 1):
 
-# split the dissolved table into its two categories so each can be written to its own shapefile
-water_gdf = gdf[gdf["category"] == "water"]
-intertidal_gdf = gdf[gdf["category"] == "intertidal"]
+        region_mask = labelled_array == region_id
 
-# write out water as its own shapefile, into this run's output_dir
-water_gdf.to_file(os.path.join(output_dir, "water_polygon.shp"))
+        xs = lon_grid[region_mask]
+        ys = lat_grid[region_mask]
 
-# write out intertidal as its own shapefile, into this run's output_dir
-intertidal_gdf.to_file(os.path.join(output_dir, "intertidal_polygon.shp"))
+        # remove NaN values
+        valid = ~np.isnan(xs) & ~np.isnan(ys)
+        xs = xs[valid]
+        ys = ys[valid]
 
-print(f"Wrote {len(water_gdf)} water polygon(s) to {os.path.join(output_dir, 'water_polygon.shp')}")
-print(f"Wrote {len(intertidal_gdf)} intertidal polygon(s) to {os.path.join(output_dir, 'intertidal_polygon.shp')}")
+        # ignore tiny regions
+        if len(xs) < 3:
+            continue
+
+        # create convex hull around this individual region
+        polygon = MultiPoint(
+            list(zip(xs, ys))
+        ).convex_hull
+
+        centroid = polygon.centroid
+
+        records.append(
+            {
+                "category": category,
+                "region_id": region_id,
+                "num_points": len(xs),
+                "area": polygon.area,
+                "cent_lon": centroid.x,
+                "cent_lat": centroid.y,
+                "geometry": polygon,
+            }
+        )
+
+    # convert polygons into GeoDataFrame
+    polygon_gdf = gpd.GeoDataFrame(
+        records,
+        crs="EPSG:4326"
+    )
+
+    # save shapefile using your original naming style
+    polygon_gdf.to_file(
+        os.path.join(output_dir, f"{category}_polygon.shp")
+    )
+
+    print(
+        f"Wrote {len(polygon_gdf)} {category} polygons to "
+        f"{os.path.join(output_dir, f'{category}_polygon.shp')}"
+    )
+
+    return polygon_gdf
+
+
+# create water and intertidal polygons
+water_gdf = export("water", water)
+intertidal_gdf = export("intertidal", intertidal)
+
+
+# print polygon information
+print("\nWater polygon shapes:")
+print(water_gdf.geometry.apply(lambda x: x.geom_type))
+
+print("\nIntertidal polygon shapes:")
+print(intertidal_gdf.geometry.apply(lambda x: x.geom_type))
+
+
+print(f"\nNumber of water polygons: {len(water_gdf)}")
+print(f"Number of intertidal polygons: {len(intertidal_gdf)}")
+
+
+# plot output polygons for checking
+
+fig, ax = plt.subplots(figsize=(10, 10))
+
+if water_gdf is not None:
+    water_gdf.boundary.plot(
+        ax=ax,
+        color="blue",
+        linewidth=1.5,
+        label="Water"
+    )
+
+if intertidal_gdf is not None:
+    intertidal_gdf.boundary.plot(
+        ax=ax,
+        color="red",
+        linewidth=1.5,
+        label="Intertidal"
+    )
+
+
+ax.set_title("SWOT PIXC Water and Intertidal Polygons")
+ax.set_xlabel("Longitude")
+ax.set_ylabel("Latitude")
+ax.legend()
+
+plt.show()
 
