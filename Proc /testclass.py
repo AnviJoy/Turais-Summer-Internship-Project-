@@ -1,4 +1,4 @@
-from swot_intertidal_pipeline import SWOTIntertidalPipeline, SWOTPipelineConfig
+from Pipelineclass import SWOTIntertidalPipeline, SWOTPipelineConfig
 
 file = r"C:\Users\pmalesza\Documents\Python Codes\SWOT_L2_HR_PIXC_052_475_245R_20260706T065928_20260706T065939_PID0_01.nc"
 cycle = 52  
@@ -49,7 +49,7 @@ grid = pipe.aggregate_to_grid(intertidal)
 print(f"\nStep 8 — aggregate_to_grid: {len(grid)} output cells")
 print(grid.head())
 
-grid_stats = pipe.validate_against_dem(grid, r"path\to\reference_dem.tif")
-print(grid_stats)
+#grid_stats = pipe.validate_against_dem(grid, r"path\to\reference_dem.tif")
+#print(grid_stats)
 
 print("\nDone.")
