@@ -1,37 +1,58 @@
+
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
 import xarray as xr
+import netCDF4 as nc
 from skimage.morphology import remove_small_objects, binary_closing, disk
 from scipy.ndimage import binary_fill_holes
+from netCDF4 import Dataset
+import matplotlib.colors as mcolors
 
-file = r"C:\Users\pmalesza\Documents\Python Codes\SWOT_L2_HR_PIXC_052_475_245R_20260706T065928_20260706T065939_PID0_01.nc"
-
-data = xr.open_dataset(file, group="pixel_cloud")
-
-mask = np.ones(data.longitude.values.shape, dtype=bool)
-
-az_sub = data.azimuth_index.values[mask].astype(int)
-rg_sub = data.range_index.values[mask].astype(int)
-
-classification_sub = data.classification.values[mask]
-classification_qual_sub = data.classification_qual.values[mask]
-interferogram_qual_sub = data.interferogram_qual.values[mask]
-sig0_qual_sub = data.sig0_qual.values[mask]
-
-land_sub = (
-    (classification_sub == 1)
-    #& (classification_sub == 7)
-    #& (classification_sub == 6)
-    & (classification_qual_sub == 0)
-    #& (interferogram_qual_sub == 0)
-    #& (sig0_qual_sub == 0)
+data = xr.open_dataset(
+    r"\Users\pmalesza\Documents\Python Codes\SWOT_L2_HR_PIXC_052_475_245R_20260706T065928_20260706T065939_PID0_01.nc",
+    group="pixel_cloud"
 )
+
+geom = data.geometry.iloc[0]
+
+if geom.geom_type == "LineString":
+    poly = Polygon(geom.coords)
+else:
+    poly = geom
+
+lon = data.longitude.values
+lat = data.latitude.values
+
+mask = np.array([
+    poly.covers(Point(lon, lat))
+    for lon, lat in zip(
+        data.longitude.values,
+        data.latitude.values
+    )
+])
+
+az = data.azimuth_index.values.astype(int)
+rg = data.range_index.values.astype(int)
+
+land_class = (
+    mask
+    & (data.classification.values == 1)
+    & (data.classification_qual.values == 0)
+    & (data.interferogram_qual.values == 0)
+    & (data.sig0_qual.values == 0)
+)
+
+az_sub = az[mask]
+rg_sub = rg[mask]
+land_sub = land_class[mask]
 
 az_min, az_max = az_sub.min(), az_sub.max()
 rg_min, rg_max = rg_sub.min(), rg_sub.max()
 n_az = az_max - az_min + 1
 n_rg = rg_max - rg_min + 1
+
+#land_grid = np.ones((az_max - az_min + 1, rg_max - rg_min + 1), dtype=int)
+#land_grid[az_sub - az_min, rg_sub - rg_min] = 0
 
 land_grid = np.zeros((n_az, n_rg), dtype=bool)
 land_grid[az_sub - az_min, rg_sub - rg_min] = land_sub
@@ -39,59 +60,55 @@ land_grid[az_sub - az_min, rg_sub - rg_min] = land_sub
 populated = np.zeros((n_az, n_rg), dtype=bool)
 populated[az_sub - az_min, rg_sub - rg_min] = True
 
-BW = land_grid | ~populated
+#populated = np.zeros((n_az, n_rg), dtype=int)
+#populated[az_sub - az_min, rg_sub - rg_min] = True
+
+BW = land_grid | ~populated   
 se = disk(2)
 
 BW1 = remove_small_objects(BW, min_size=50, connectivity=2)
 BW2 = binary_closing(BW1, se)
 BW3 = binary_fill_holes(BW2)
 
-fig, axes = plt.subplots(2, 2, figsize=(12, 8), sharex=True, sharey=True)
-titles = [
-    "Initial Land Mask",
-    "After bwareaopen",
-    "After bwareaopen + imclose",
-    "After bwareaopen + imclose + imfill",
-]
-for ax, img, title in zip(axes.ravel(), [BW, BW1, BW2, BW3], titles):
-    ax.imshow(img, origin="lower", aspect="auto")
-    ax.set_title(title)
-plt.tight_layout()
-plt.show()
-
 land_mask_clean = BW3
+
 water_grid = ~BW3
 water_mask = water_grid[az_sub - az_min, rg_sub - rg_min]
 
-lat_sub = data.latitude.values[mask]
-lon_sub = data.longitude.values[mask]
-height_sub = data.height.values[mask]
-geolocation_qual_sub = data.geolocation_qual.values[mask]
-coherent_power_sub = data.coherent_power.values[mask]  
-sig0_sub = data.sig0.values[mask]
+file = r"\Users\pmalesza\Documents\Python Codes\SWOT_L2_HR_PIXC_052_475_245R_20260706T065928_20260706T065939_PID0_01.nc"
+
+with Dataset(file, "r") as nc:
+
+    pixc = nc.groups["pixel_cloud"]
+    tvp = nc.groups["tvp"]
+
+    lat = pixc.variables["latitude"][:][mask]
+    lon = pixc.variables["longitude"][:][mask]
+    height = pixc.variables["height"][:][mask]
+    classification = pixc.variables["classification"][:][mask]
+    geolocation_qual = pixc.variables["geolocation_qual"][:][mask]
+
+classification = data.classification.values[mask]
+longitude = data.longitude.values[mask]
+latitude = data.latitude.values[mask]
 
 valid = (
     water_mask
-    & np.isfinite(lat_sub)
-    & np.isfinite(lon_sub)
-    & np.isfinite(height_sub)
-    & (np.abs(height_sub) < 1e4)
-    & np.isfinite(classification_sub)
-    & np.isfinite(coherent_power_sub)
-    & (coherent_power_sub > 0)
-    & np.isfinite(sig0_sub)
-    & (sig0_sub > 0)
-    & (geolocation_qual_sub == 0)
-    & (classification_qual_sub == 0)
-    & (interferogram_qual_sub == 0)
-    & (sig0_qual_sub == 0)
-    & (classification_sub != 7)
-    & (classification_sub != 6)
+    & np.isfinite(lat)
+    & np.isfinite(lon)
+    & np.isfinite(height)
+    & (np.abs(height) < 1e4)
+    & np.isfinite(classification)
+    & np.isfinite(coherent_power) 
+    & (coherent_power > 0)
+    & np.isfinite(sig0) 
+    & (sig0 > 0)
+    & (geolocation_qual == 0)   
 )
 
-classification_final = classification_sub[valid]
-class_lon = lon_sub[valid]
-class_lat = lat_sub[valid]
+classification = classification[valid]
+class_lon = longitude[valid]
+class_lat = latitude[valid]
 
 class_labels = [
     "Land",
@@ -100,20 +117,23 @@ class_labels = [
     "Open water",
     "Dark water",
     "Low coherence water near land",
-    "Open low coherence water",
+    "Open low coherence water"
 ]
 
-norm = mcolors.BoundaryNorm(np.arange(0.5, 8.5, 1), 7)
+norm = mcolors.BoundaryNorm(
+    np.arange(0.5, 8.5, 1),
+    7
+)
 
 plt.figure(figsize=(8, 8))
 
 sc = plt.scatter(
     class_lon,
     class_lat,
-    c=classification_final,
+    c=classification,
     s=2,
     cmap="tab10",
-    norm=norm,
+    norm=norm
 )
 
 cbar = plt.colorbar(sc, ticks=np.arange(1, 8))
