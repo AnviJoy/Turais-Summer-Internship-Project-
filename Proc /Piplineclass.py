@@ -11,6 +11,10 @@ from shapely.geometry import shape as _shapely_shape
 from scipy.signal import argrelextrema
 from shapely.geometry import Polygon, MultiPolygon
 from shapely.ops import unary_union
+try:
+    from shapely import coverage_union_all as _coverage_union_all
+except ImportError:
+    _coverage_union_all = None
 from shapely.geometry import Point
 from shapely import vectorized
 from skimage.morphology import remove_small_objects, binary_closing, disk
@@ -42,6 +46,9 @@ class SWOTPipelineConfig:
     eps_low_divisor: float = 50.0
     mask_grid_res_deg: float = 0.0001
     mask_validity_quantile: float = 0.90
+    mask_closing_disk_radius: int = 2
+    mask_min_object_size: int = 8
+    mask_connectivity: int = 2
     output_grid_res_deg: float = 0.00025
     mc_realizations: int = 1000
     mc_ci_alpha: float = 0.025
@@ -245,11 +252,6 @@ class SWOTIntertidalPipeline:
 
         max_samples = self.cfg.kde_max_samples
         if max_samples is not None and h_a.size > max_samples:
-            # gaussian_kde evaluation is O(n_points * n_grid_bins); on full
-            # pixel clouds (10^5-10^6 points) that's the dominant cost of
-            # filter_open_water. A large random subsample gives a
-            # statistically equivalent density estimate for peak/cutoff
-            # detection at a fraction of the runtime.
             rng = np.random.default_rng(self.cfg.kde_random_seed)
             h_a = rng.choice(h_a, size=max_samples, replace=False)
 
@@ -413,25 +415,42 @@ class SWOTIntertidalPipeline:
         threshold = np.quantile(total_validity[total_validity > 0], validity_quantile) \
             if np.any(total_validity > 0) else 0
         high_validity_mask = total_validity >= threshold
-
-        # Vectorize the boolean grid into a handful of merged polygons rather
-        # than building one Polygon per True cell (which does not scale past
-        # a few hundred thousand cells before unary_union grinds to a halt).
+       
         print('step 5-4')
+
+        se = disk(self.cfg.mask_closing_disk_radius)
+        closed_mask = binary_closing(high_validity_mask, se)
+        denoised_mask = remove_small_objects(
+            closed_mask, min_size=self.cfg.mask_min_object_size,
+            connectivity=self.cfg.mask_connectivity,
+        )
+
         transform = Affine.translation(lon_min, lat_min) * \
             Affine.scale(grid_res_deg, grid_res_deg)
-        mask_u8 = high_validity_mask.astype(np.uint8)
+        mask_u8 = denoised_mask.astype(np.uint8)
         print('step 5-5')
         polygons = [
             _shapely_shape(geom)
-            for geom, val in _rio_shapes(mask_u8, mask=high_validity_mask, transform=transform)
+            for geom, val in _rio_shapes(
+                mask_u8, mask=denoised_mask, transform=transform, connectivity=8,
+            )
             if val == 1
         ]
         print('step 5-6')
         if not polygons:
             raise ValueError("No high-validity cells found; lower validity_quantile.")
 
-        merged = unary_union(polygons).buffer(grid_res_deg).buffer(-grid_res_deg)
+        polygons = gpd.GeoSeries(polygons).buffer(0)
+
+        if _coverage_union_all is not None:
+            try:
+                merged = _coverage_union_all(polygons.values)
+            except Exception:
+                merged = unary_union(polygons.values)
+        else:
+            merged = unary_union(polygons.values)
+        #merged = merged.buffer(grid_res_deg).buffer(-grid_res_deg)
+        merged = merged 
         print('step 5-7')
         if isinstance(merged, MultiPolygon):
             largest = max(merged.geoms, key=lambda p: p.area)
