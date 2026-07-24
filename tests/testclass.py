@@ -1,7 +1,10 @@
-from Pipelineclass import SWOTIntertidalPipeline, SWOTPipelineConfig
+import os
+
+from Piplineclass import SWOTIntertidalPipeline, SWOTPipelineConfig
 
 file = r"C:\Users\pmalesza\Documents\Python Codes\SWOT_L2_HR_PIXC_052_475_245R_20260706T065928_20260706T065939_PID0_01.nc"
-cycle = 52  
+output_base = r"C:\Users\pmalesza\Documents\Python Codes\SWOT_outputs"
+cycle = 52
 
 ref_lat = None
 ref_lon = None
@@ -9,16 +12,28 @@ ref_lon = None
 cfg = SWOTPipelineConfig()
 pipe = SWOTIntertidalPipeline(cfg)
 
-pixc = pipe.read_pixel_cloud(file, cycle)
-print("Step 1 — read_pixel_cloud:", pixc.shape)
+output_dir = pipe.make_output_directory(file, output_base)
+print("Output directory:", output_dir)
+
+pixc_full = pipe.read_pixel_cloud(file, cycle)
+print("Step 1 — read_pixel_cloud:", pixc_full.shape)
+print(pixc_full.head())
+
+kml_path = pipe.export_bbox_kml(pixc_full["longitude"], pixc_full["latitude"],
+                                 file, output_base, name="SWOT PIXC Swath")
+print(f"\nStep 1b — export_bbox_kml: wrote boundary KML to {kml_path}")
+
+pixc = pipe.subset_by_kml(pixc_full, kml_path)
+print(f"\nStep 1c — subset_by_kml: {len(pixc)} / {len(pixc_full)} pixels kept "
+      f"inside {kml_path}")
 print(pixc.head())
 
 if ref_lat is None or ref_lon is None:
     ref_lat = float(pixc["latitude"].median())
     ref_lon = float(pixc["longitude"].median())
-    print(f"No ref_lat/ref_lon set, using region centroid as a placeholder: "
+    print(f"No ref_lat/ref_lon set, using subset centroid as a placeholder: "
           f"({ref_lat:.6f}, {ref_lon:.6f})")
-  
+
 pixc = pipe.compute_height_anomaly(pixc, ref_lat, ref_lon)
 print("\nStep 2 — compute_height_anomaly: added h_a column")
 print(pixc[["height", "h_a"]].describe())
@@ -48,6 +63,11 @@ print(intertidal[["height", "sigma_h"]].describe())
 grid = pipe.aggregate_to_grid(intertidal)
 print(f"\nStep 8 — aggregate_to_grid: {len(grid)} output cells")
 print(grid.head())
+
+grid_csv = os.path.join(output_dir, "intertidal_grid.csv")
+grid.to_csv(grid_csv, index=False)
+print(f"Wrote gridded output to {grid_csv}")
+
 
 #grid_stats = pipe.validate_against_dem(grid, r"path\to\reference_dem.tif")
 #print(grid_stats)
