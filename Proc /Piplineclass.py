@@ -62,6 +62,24 @@ class SWOTPipelineConfig:
     open_water_class_codes: tuple = (3, 4)
     dark_water_class_codes: tuple = (5, 6)
 
+    # --- Added: classification codes / grid settings used by the
+    # az/range grid + polygon-export methods (read_pixel_cloud_arrays,
+    # build_land_water_intertidal_grids, polygons_from_grid,
+    # run_polygon_export_pipeline). Values match what Polygon.py used
+    # to hardcode — confirm against the PDD/ATBD table like the codes above.
+    land_class_code: int = 1
+    water_class_codes: tuple = (4,)
+    intertidal_class_codes: tuple = (2, 3)
+    quality_flag_names: tuple = (
+        "classification_qual", "interferogram_qual",
+        "sig0_qual", "geolocation_qual",
+    )
+    land_closing_disk_radius: int = 2
+    land_min_object_size: int = 50
+    land_connectivity: int = 2
+    min_region_points: int = 10
+    raster_default_resolution_deg: float = 0.0001
+
     # Variable name aliases for reading L2_HR_PIXC granules.
     pixc_var_aliases: dict = field(default_factory=lambda: {
         "height": ["height"],
@@ -391,7 +409,6 @@ class SWOTIntertidalPipeline:
                                  grid_res_deg: Optional[float] = None,
                                  validity_quantile: Optional[float] = None):
         """Build and cache the region's water extent polygon from per-cycle pixel validity."""
-        print('step 5-1')
         grid_res_deg = grid_res_deg or self.cfg.mask_grid_res_deg
         validity_quantile = validity_quantile if validity_quantile is not None \
             else self.cfg.mask_validity_quantile
@@ -405,18 +422,17 @@ class SWOTIntertidalPipeline:
         lon_bins = np.arange(lon_min, lon_max + grid_res_deg, grid_res_deg)
 
         total_validity = np.zeros((len(lat_bins) - 1, len(lon_bins) - 1))
-        print('step 5-2')
+
         for df in per_cycle_filtered_pixc:
             counts, _, _ = np.histogram2d(
                 df["latitude"], df["longitude"], bins=[lat_bins, lon_bins]
             )
             total_validity += counts
-        print('step 5-3')
+        
         threshold = np.quantile(total_validity[total_validity > 0], validity_quantile) \
             if np.any(total_validity > 0) else 0
         high_validity_mask = total_validity >= threshold
        
-        print('step 5-4')
 
         se = disk(self.cfg.mask_closing_disk_radius)
         closed_mask = binary_closing(high_validity_mask, se)
@@ -428,7 +444,7 @@ class SWOTIntertidalPipeline:
         transform = Affine.translation(lon_min, lat_min) * \
             Affine.scale(grid_res_deg, grid_res_deg)
         mask_u8 = denoised_mask.astype(np.uint8)
-        print('step 5-5')
+
         polygons = [
             _shapely_shape(geom)
             for geom, val in _rio_shapes(
@@ -436,7 +452,7 @@ class SWOTIntertidalPipeline:
             )
             if val == 1
         ]
-        print('step 5-6')
+        
         if not polygons:
             raise ValueError("No high-validity cells found; lower validity_quantile.")
 
@@ -451,12 +467,12 @@ class SWOTIntertidalPipeline:
             merged = unary_union(polygons.values)
         #merged = merged.buffer(grid_res_deg).buffer(-grid_res_deg)
         merged = merged 
-        print('step 5-7')
+        
         if isinstance(merged, MultiPolygon):
             largest = max(merged.geoms, key=lambda p: p.area)
         else:
             largest = merged
-        print('step 5-8')
+        
         cleaned = self._clean_polygon(largest)
         self._water_extent_mask = cleaned
         return cleaned
@@ -772,6 +788,37 @@ class SWOTIntertidalPipeline:
             "lat_grid": lat_grid,
         }
 
+    def scatter_indices_to_grid(self, az: np.ndarray, rg: np.ndarray, grids: dict) -> np.ndarray:
+        """Return a boolean grid (same shape as `grids`) marking every
+        (az, rg) pixel-index pair present in the given arrays.
+
+        Used to project a *filtered* pixel set — e.g. the output of
+        compute_height_anomaly -> filter_phase_noise -> filter_open_water ->
+        apply_water_extent_mask — onto the azimuth/range grid built by
+        build_land_water_intertidal_grids, so polygons_from_grid can be
+        restricted to just those surviving pixels instead of every pixel
+        matching a raw classification code."""
+        az = np.asarray(az).astype(int)
+        rg = np.asarray(rg).astype(int)
+        az_min, rg_min = grids["az_min"], grids["rg_min"]
+        n_az, n_rg = grids["populated"].shape
+
+        row = az - az_min
+        col = rg - rg_min
+        in_bounds = (row >= 0) & (row < n_az) & (col >= 0) & (col < n_rg)
+
+        kept = np.zeros((n_az, n_rg), dtype=bool)
+        kept[row[in_bounds], col[in_bounds]] = True
+        return kept
+
+    def restrict_grids_to_mask(self, grids: dict, keep_mask: np.ndarray) -> dict:
+        """Return a copy of `grids` with `final_mask` ANDed against `keep_mask`
+        (e.g. the output of scatter_indices_to_grid), leaving the original
+        grids dict untouched."""
+        restricted = dict(grids)
+        restricted["final_mask"] = grids["final_mask"] & keep_mask
+        return restricted
+
     def polygons_from_grid(self, category: str, codes: Sequence[int], grids: dict):
         """Convex-hull polygons for each connected region of `codes` pixels"""
         final_mask = grids["final_mask"]
@@ -1023,7 +1070,39 @@ class SWOTIntertidalPipeline:
 
         plt.tight_layout()
         return ax
-    
+
+    def plot_category_polygons(self, category_gdfs: dict, ax=None,
+                                colors: Optional[dict] = None):
+        """Plot polygon boundaries for one or more categories on the same axes.
+
+        `category_gdfs` maps category name -> GeoDataFrame, e.g.
+        {"water": water_gdf, "intertidal": intertidal_gdf}. Empty/None
+        GeoDataFrames are skipped (an empty GeoDataFrame passed to
+        .plot() raises "aspect must be finite and positive")."""
+        default_colors = {"water": "blue", "intertidal": "red", "land": "green"}
+        colors = colors or default_colors
+
+        if ax is None:
+            _, ax = plt.subplots(figsize=(10, 10))
+
+        for category, gdf in category_gdfs.items():
+            if gdf is None or len(gdf) == 0:
+                continue
+            gdf.boundary.plot(
+                ax=ax,
+                color=colors.get(category, "black"),
+                linewidth=1.5,
+                label=category.capitalize(),
+            )
+
+        ax.set_title("SWOT PIXC Category Polygons")
+        ax.set_xlabel("Longitude")
+        ax.set_ylabel("Latitude")
+        ax.legend()
+
+        plt.tight_layout()
+        return ax
+
     def make_output_directory(self, filepath: str, output_base: str) -> str:
         """
         Create an output directory based on the PIXC filename"""
