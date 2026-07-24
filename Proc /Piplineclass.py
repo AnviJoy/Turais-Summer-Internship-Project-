@@ -754,12 +754,7 @@ class SWOTIntertidalPipeline:
         }
 
     def polygons_from_grid(self, category: str, codes: Sequence[int], grids: dict):
-        """Convex-hull polygons for each connected region of `codes` pixels.
-
-        Mirrors the `export()` function from the standalone script: label
-        connected components in the final keep-mask restricted to `codes`,
-        then build a convex-hull polygon (in EPSG:4326) per region.
-        """
+        """Convex-hull polygons for each connected region of `codes` pixels"""
         final_mask = grids["final_mask"]
         classification_grid = grids["classification_grid"]
         lon_grid = grids["lon_grid"]
@@ -843,33 +838,7 @@ class SWOTIntertidalPipeline:
     def export_bbox_kml(self, lon: np.ndarray, lat: np.ndarray,
                          filepath: str, output_base: str,
                          name: str = "SWOT PIXC Swath") -> str:
-        """Write a rectangular bounding-box KML around a cloud of lon/lat points.
-
-        Reusable version of the standalone "KML of the PIXC swath using a
-        Bounding Box" script: flattens the coordinates, drops NaNs/out-of-range/
-        duplicate points, takes the min/max lon/lat, and writes the resulting
-        rectangle as a single KML polygon. Handy for quickly drawing a rough
-        AOI box in Google Earth that can then be hand-edited into a tighter
-        polygon and fed back in via `subset_by_kml`.
-
-        The output goes to `<output_base>/<granule_name>/swath_bbox.kml`,
-        via `make_output_directory`, same convention as every other output
-        this class writes.
-
-        Parameters
-        ----------
-        lon, lat : array-like
-            Longitude/latitude values, any shape (will be flattened), e.g.
-            `arrays["lon"], arrays["lat"]` from `read_pixel_cloud_arrays`,
-            or `pixc_df["longitude"], pixc_df["latitude"]`.
-        filepath : str
-            Path to the source PIXC granule (used to name the output folder).
-        output_base : str
-            Base output directory; the granule-named subfolder is created
-            under this via `make_output_directory`.
-        name : str
-            Name label for the KML polygon placemark.
-        """
+        """Write a rectangular bounding-box KML around a cloud of lon/lat points"""
         lon = np.asarray(lon).ravel()
         lat = np.asarray(lat).ravel()
 
@@ -914,32 +883,7 @@ class SWOTIntertidalPipeline:
     def subset_by_kml(self, pixc_df: pd.DataFrame, kml_path: str,
                        lon_col: str = "longitude",
                        lat_col: str = "latitude") -> pd.DataFrame:
-        """Subset a pixel-cloud DataFrame to points that fall inside a KML polygon.
-
-        Reusable version of the standalone "mask PIXC points against a KML
-        boundary" script: reads the (first) geometry out of `kml_path` —
-        typically a polygon you drew/edited in Google Earth, or one produced
-        by `export_bbox_kml` — and keeps only the rows of `pixc_df` whose
-        (lon, lat) fall inside (or on the boundary of) that polygon.
-
-        Uses `shapely.vectorized` instead of a per-row `Point(...).covers()`
-        loop, which is dramatically faster on full pixel clouds (10^5-10^6 rows).
-
-        Parameters
-        ----------
-        pixc_df : pd.DataFrame
-            Pixel-cloud DataFrame, e.g. from `read_pixel_cloud`. Must have
-            `lon_col`/`lat_col` columns.
-        kml_path : str
-            Path to the boundary .kml (polygon or closed line string).
-        lon_col, lat_col : str
-            Column names holding longitude/latitude in `pixc_df`.
-
-        Returns
-        -------
-        pd.DataFrame
-            The subset of `pixc_df` inside the KML boundary (index reset).
-        """
+        """Subset a pixel-cloud DataFrame to points that fall inside a KML polygon"""
         kml_gdf = gpd.read_file(kml_path)
         if kml_gdf.empty:
             raise ValueError(f"No geometry found in {kml_path}.")
@@ -957,8 +901,6 @@ class SWOTIntertidalPipeline:
         lon = pixc_df[lon_col].to_numpy(dtype=float)
         lat = pixc_df[lat_col].to_numpy(dtype=float)
 
-        # contains + touches ~= shapely's covers() (interior OR boundary),
-        # but vectorized over the whole array instead of a Python loop.
         mask = vectorized.contains(poly, lon, lat) | vectorized.touches(poly, lon, lat)
 
         subset = pixc_df[mask].reset_index(drop=True)
@@ -968,11 +910,7 @@ class SWOTIntertidalPipeline:
     def rasterize_category_polygons(self, gdf, output_path: str,
                                      resolution_deg: Optional[float] = None,
                                      burn_value: int = 1) -> str:
-        """Burn a polygon GeoDataFrame into a single-band GeoTIFF using rasterio.
-
-        Useful for turning the water/intertidal polygons into a raster mask
-        (e.g. for overlaying on a DEM, or for further raster analysis).
-        """
+        """Burn a polygon GeoDataFrame into a single-band GeoTIFF using rasterio"""
         resolution_deg = resolution_deg or self.cfg.raster_default_resolution_deg
 
         if gdf is None or len(gdf) == 0:
@@ -1011,12 +949,7 @@ class SWOTIntertidalPipeline:
         return values
 
     def pixel_category_flat(self, arrays: dict, grids: dict) -> np.ndarray:
-        """Per-pixel category code in flat (original) pixel order.
-
-        0 = excluded (land or failed quality/classification), 1 = water,
-        2 = intertidal. Matches the category scheme used by
-        `plot_water_intertidal_mask`.
-        """
+        """Per-pixel category code in flat (original) pixel order"""
         az, rg = arrays["az"], arrays["rg"]
         classification = arrays["classification"]
         az_min, rg_min = grids["az_min"], grids["rg_min"]
@@ -1074,17 +1007,7 @@ class SWOTIntertidalPipeline:
     
     def make_output_directory(self, filepath: str, output_base: str) -> str:
         """
-        Create an output directory based on the PIXC filename.
-
-        Example
-        -------
-        SWOT_L2_HR_PIXC_052_475_245R_20260706T065928_20260706T065939_PID0_01.nc
-
-        becomes
-
-        <output_base>/
-            052_475_245R_20260706T065928_20260706T065939_PID0_01/
-        """
+        Create an output directory based on the PIXC filename"""
 
         stem = os.path.splitext(os.path.basename(filepath))[0]
         prefix = "SWOT_L2_HR_PIXC_"
@@ -1132,14 +1055,8 @@ class SWOTIntertidalPipeline:
                                      make_plot: bool = True,
                                      make_rasters: bool = False,
                                      raster_resolution_deg: Optional[float] = None) -> dict:
-        """End-to-end: read PIXC -> build masks -> export water/intertidal
-        polygons as shapefile + KML -> (optionally) rasterize -> (optionally) plot.
-
-        This is the reusable-pipeline equivalent of the standalone
-        "SWOT PIXC to polygons with KML" script. `output_dir` is derived from
-        `filepath`/`output_base` via `make_output_directory`, the same
-        directory convention used by `create_kml_subset`.
-        """
+        """End-to-end: read PIXC, build masks, export water/intertidal
+        polygons as shapefile + KML, (optionally) rasterize, (optionally) plot."""
         output_dir = self.make_output_directory(filepath, output_base)
 
         arrays = self.read_pixel_cloud_arrays(filepath, group=group)
