@@ -1,12 +1,31 @@
 import warnings
 from dataclasses import dataclass, field
 from typing import Optional, Sequence
-
 import numpy as np
 import pandas as pd
 from scipy import stats
 import xarray as xr
-
+from rasterio.features import shapes as _rio_shapes
+from affine import Affine
+from shapely.geometry import shape as _shapely_shape
+from scipy.signal import argrelextrema
+from shapely.geometry import Polygon, MultiPolygon
+from shapely.ops import unary_union
+from shapely.geometry import Point
+from shapely import vectorized
+from skimage.morphology import remove_small_objects, binary_closing, disk
+from scipy.ndimage import binary_fill_holes
+from shapely.geometry import MultiPoint
+import geopandas as gpd
+from scipy.ndimage import label
+import os
+import simplekml
+import rasterio
+from rasterio.transform import from_bounds
+from rasterio.features import rasterize
+from rasterio.transform import rowcol
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
 
 @dataclass
 class SWOTPipelineConfig:
@@ -16,6 +35,9 @@ class SWOTPipelineConfig:
     ref_point_buffer_deg: float = 0.001
     pdf_bin_width_m: float = 0.05
     pdf_peak_min_density: float = 0.10
+    pdf_max_bins: int = 2000
+    kde_max_samples: Optional[int] = 50_000
+    kde_random_seed: Optional[int] = 0
     eps_up_fraction: float = 0.01
     eps_low_divisor: float = 50.0
     mask_grid_res_deg: float = 0.0001
@@ -69,14 +91,6 @@ class SWOTIntertidalPipeline:
                           group: Optional[str] = None,
                           extra_var_aliases: Optional[dict] = None) -> pd.DataFrame:
         """Read an L2_HR_PIXC granule into a flat DataFrame with standardized columns."""
-        #try:
-            #import xarray as xr
-        #except ImportError as e:
-            #raise ImportError(
-            #     "reading L2_HR_PIXC granules requires xarray + netCDF4/h5netcdf. "
-            #     "Install with `pip install xarray netCDF4`."
-            # ) from e
-
         ds = self._open_pixc_group(xr, filepath, group)
 
         aliases = {k: list(v) for k, v in self.cfg.pixc_var_aliases.items()}
@@ -229,7 +243,18 @@ class SWOTIntertidalPipeline:
         if h_a.size < 2:
             raise ValueError("Not enough h_a samples to build a KDE.")
 
+        max_samples = self.cfg.kde_max_samples
+        if max_samples is not None and h_a.size > max_samples:
+            # gaussian_kde evaluation is O(n_points * n_grid_bins); on full
+            # pixel clouds (10^5-10^6 points) that's the dominant cost of
+            # filter_open_water. A large random subsample gives a
+            # statistically equivalent density estimate for peak/cutoff
+            # detection at a fraction of the runtime.
+            rng = np.random.default_rng(self.cfg.kde_random_seed)
+            h_a = rng.choice(h_a, size=max_samples, replace=False)
+
         n_bins = max(int(np.ceil((h_a.max() - h_a.min()) / bin_width)), 10)
+        n_bins = min(n_bins, self.cfg.pdf_max_bins)
         grid = np.linspace(h_a.min(), h_a.max(), n_bins)
 
         kde = stats.gaussian_kde(h_a)
@@ -239,7 +264,6 @@ class SWOTIntertidalPipeline:
     def find_pdf_peaks(self, grid: np.ndarray, pdf: np.ndarray,
                         min_density: Optional[float] = None) -> np.ndarray:
         """Return indices of PDF local maxima with density >= min_density."""
-        from scipy.signal import argrelextrema
         min_density = min_density if min_density is not None \
             else self.cfg.pdf_peak_min_density
 
@@ -269,7 +293,6 @@ class SWOTIntertidalPipeline:
         upper_idx = int(np.searchsorted(grid, upper_cutoff))
         window = slice(peak_idx, max(upper_idx, peak_idx + 1))
 
-        from scipy.signal import argrelextrema
         minima_idx = argrelextrema(dpdf[window], np.less_equal, order=1)[0] + peak_idx
 
         eps_low_divisor = self.cfg.eps_low_divisor
@@ -366,15 +389,7 @@ class SWOTIntertidalPipeline:
                                  grid_res_deg: Optional[float] = None,
                                  validity_quantile: Optional[float] = None):
         """Build and cache the region's water extent polygon from per-cycle pixel validity."""
-        try:
-            from shapely.geometry import Polygon, MultiPolygon
-            from shapely.ops import unary_union
-        except ImportError as e:
-            raise ImportError(
-                "build_water_extent_mask requires shapely. "
-                "Install with `pip install shapely`."
-            ) from e
-
+        print('step 5-1')
         grid_res_deg = grid_res_deg or self.cfg.mask_grid_res_deg
         validity_quantile = validity_quantile if validity_quantile is not None \
             else self.cfg.mask_validity_quantile
@@ -388,46 +403,47 @@ class SWOTIntertidalPipeline:
         lon_bins = np.arange(lon_min, lon_max + grid_res_deg, grid_res_deg)
 
         total_validity = np.zeros((len(lat_bins) - 1, len(lon_bins) - 1))
-
+        print('step 5-2')
         for df in per_cycle_filtered_pixc:
             counts, _, _ = np.histogram2d(
                 df["latitude"], df["longitude"], bins=[lat_bins, lon_bins]
             )
             total_validity += counts
-
+        print('step 5-3')
         threshold = np.quantile(total_validity[total_validity > 0], validity_quantile) \
             if np.any(total_validity > 0) else 0
         high_validity_mask = total_validity >= threshold
 
-        polygons = []
-        for i in range(high_validity_mask.shape[0]):
-            for j in range(high_validity_mask.shape[1]):
-                if high_validity_mask[i, j]:
-                    polygons.append(Polygon([
-                        (lon_bins[j], lat_bins[i]),
-                        (lon_bins[j + 1], lat_bins[i]),
-                        (lon_bins[j + 1], lat_bins[i + 1]),
-                        (lon_bins[j], lat_bins[i + 1]),
-                    ]))
-
+        # Vectorize the boolean grid into a handful of merged polygons rather
+        # than building one Polygon per True cell (which does not scale past
+        # a few hundred thousand cells before unary_union grinds to a halt).
+        print('step 5-4')
+        transform = Affine.translation(lon_min, lat_min) * \
+            Affine.scale(grid_res_deg, grid_res_deg)
+        mask_u8 = high_validity_mask.astype(np.uint8)
+        print('step 5-5')
+        polygons = [
+            _shapely_shape(geom)
+            for geom, val in _rio_shapes(mask_u8, mask=high_validity_mask, transform=transform)
+            if val == 1
+        ]
+        print('step 5-6')
         if not polygons:
             raise ValueError("No high-validity cells found; lower validity_quantile.")
 
         merged = unary_union(polygons).buffer(grid_res_deg).buffer(-grid_res_deg)
-
+        print('step 5-7')
         if isinstance(merged, MultiPolygon):
             largest = max(merged.geoms, key=lambda p: p.area)
         else:
             largest = merged
-
+        print('step 5-8')
         cleaned = self._clean_polygon(largest)
         self._water_extent_mask = cleaned
         return cleaned
 
     def _clean_polygon(self, polygon):
         """Drop small holes and lightly smooth a polygon's boundary."""
-        from shapely.geometry import Polygon
-
         min_hole_area = self.cfg.min_hole_area_deg2
         kept_interiors = [
             ring for ring in polygon.interiors
@@ -450,28 +466,14 @@ class SWOTIntertidalPipeline:
     def apply_water_extent_mask(self, candidates_df: pd.DataFrame,
                                  mask_polygon=None) -> pd.DataFrame:
         """Keep only candidate pixels that fall inside the water extent mask."""
-        try:
-            from shapely.geometry import Point
-            from shapely import vectorized
-            has_vectorized = True
-        except ImportError:
-            from shapely.geometry import Point
-            has_vectorized = False
-
         mask_polygon = mask_polygon or self._water_extent_mask
         if mask_polygon is None:
             raise ValueError("No water_extent_mask provided or cached; "
                               "call build_water_extent_mask first.")
 
         df = candidates_df.copy()
-        if has_vectorized:
-            inside = vectorized.contains(mask_polygon, df["longitude"].to_numpy(),
-                                          df["latitude"].to_numpy())
-        else:
-            inside = df.apply(
-                lambda r: mask_polygon.contains(Point(r["longitude"], r["latitude"])),
-                axis=1
-            ).to_numpy()
+        inside = vectorized.contains(mask_polygon, df["longitude"].to_numpy(),
+                                      df["latitude"].to_numpy())
 
         return df[inside].reset_index(drop=True)
 
@@ -583,15 +585,6 @@ class SWOTIntertidalPipeline:
     def validate_against_dem(self, grid_df: pd.DataFrame, dem_path: str,
                               stratify_by: Optional[str] = None) -> pd.DataFrame:
         """Compare gridded heights to a reference DEM and report bias/std/RMSE."""
-        try:
-            import rasterio
-            from rasterio.transform import rowcol
-        except ImportError as e:
-            raise ImportError(
-                "validate_against_dem requires rasterio. "
-                "Install with `pip install rasterio`."
-            ) from e
-
         with rasterio.open(dem_path) as src:
             rows, cols = rowcol(src.transform,
                                  grid_df["cell_lon"].to_numpy(),
@@ -672,5 +665,504 @@ class SWOTIntertidalPipeline:
                 cycle: self.validate_against_dem(grid, dem_path)
                 for cycle, grid in grids.items()
             }
+
+        return result
+    
+    def read_pixel_cloud_arrays(self, filepath: str, group: Optional[str] = None) -> dict:
+        """Read the raw per-pixel arrays needed for az/range grid masking."""
+        ds = self._open_pixc_group(xr, filepath, group)
+
+        arrays = {
+            "az": ds.azimuth_index.values.astype(int),
+            "rg": ds.range_index.values.astype(int),
+            "classification": ds.classification.values,
+            "lat": ds.latitude.values,
+            "lon": ds.longitude.values,
+        }
+        for qual_name in self.cfg.quality_flag_names:
+            arrays[qual_name] = ds[qual_name].values
+
+        return arrays
+
+    def build_land_water_intertidal_grids(self, arrays: dict) -> dict:
+        """Scatter flat pixel arrays into the azimuth/range grid, clean the
+        land mask, and derive the final water/intertidal keep-mask."""
+        az, rg = arrays["az"], arrays["rg"]
+        classification = arrays["classification"]
+
+        az_min, az_max = az.min(), az.max()
+        rg_min, rg_max = rg.min(), rg.max()
+        n_az = az_max - az_min + 1
+        n_rg = rg_max - rg_min + 1
+
+        # confidently-classified land pixels
+        land = (
+            (classification == self.cfg.land_class_code)
+            & (arrays["classification_qual"] == 0)
+        )
+
+        land_grid = np.zeros((n_az, n_rg), dtype=bool)
+        land_grid[az - az_min, rg - rg_min] = land
+
+        populated = np.zeros((n_az, n_rg), dtype=bool)
+        populated[az - az_min, rg - rg_min] = True
+
+        # clean up the land mask
+        BW = land_grid | ~populated
+        se = disk(self.cfg.land_closing_disk_radius)
+        BW1 = remove_small_objects(
+            BW, min_size=self.cfg.land_min_object_size,
+            connectivity=self.cfg.land_connectivity,
+        )
+        BW2 = binary_closing(BW1, se)
+        BW3 = binary_fill_holes(BW2)
+
+        not_land_clean = ~BW3
+
+        # a pixel only counts as "good quality" if every configured flag reads 0
+        quality = np.ones(classification.shape, dtype=bool)
+        for qual_name in self.cfg.quality_flag_names:
+            quality &= (arrays[qual_name] == 0)
+
+        classification_grid = np.zeros((n_az, n_rg), dtype=np.uint8)
+        classification_grid[az - az_min, rg - rg_min] = classification
+
+        quality_grid = np.zeros((n_az, n_rg), dtype=bool)
+        quality_grid[az - az_min, rg - rg_min] = quality
+
+        keep_codes = list(self.cfg.water_class_codes) + list(self.cfg.intertidal_class_codes)
+        final_mask = (
+            populated & quality_grid & not_land_clean
+            & np.isin(classification_grid, keep_codes)
+        )
+
+        lon_grid = np.full((n_az, n_rg), np.nan)
+        lat_grid = np.full((n_az, n_rg), np.nan)
+        lon_grid[az - az_min, rg - rg_min] = arrays["lon"]
+        lat_grid[az - az_min, rg - rg_min] = arrays["lat"]
+
+        return {
+            "az_min": az_min, "rg_min": rg_min, "n_az": n_az, "n_rg": n_rg,
+            "populated": populated,
+            "land_grid_cleaned": BW3,
+            "not_land_clean": not_land_clean,
+            "quality_grid": quality_grid,
+            "classification_grid": classification_grid,
+            "final_mask": final_mask,
+            "lon_grid": lon_grid,
+            "lat_grid": lat_grid,
+        }
+
+    def polygons_from_grid(self, category: str, codes: Sequence[int], grids: dict):
+        """Convex-hull polygons for each connected region of `codes` pixels.
+
+        Mirrors the `export()` function from the standalone script: label
+        connected components in the final keep-mask restricted to `codes`,
+        then build a convex-hull polygon (in EPSG:4326) per region.
+        """
+        final_mask = grids["final_mask"]
+        classification_grid = grids["classification_grid"]
+        lon_grid = grids["lon_grid"]
+        lat_grid = grids["lat_grid"]
+
+        category_mask = final_mask & np.isin(classification_grid, list(codes))
+        if not np.any(category_mask):
+            warnings.warn(f"No {category} pixels found.")
+            return gpd.GeoDataFrame(
+                columns=["category", "region_id", "num_points", "area",
+                         "cent_lon", "cent_lat", "geometry"],
+                geometry="geometry", crs="EPSG:4326",
+            )
+
+        labelled_array, num_features = label(category_mask, structure=np.ones((3, 3)))
+
+        records = []
+        for region_id in range(1, num_features + 1):
+            region_mask = labelled_array == region_id
+
+            xs = lon_grid[region_mask]
+            ys = lat_grid[region_mask]
+            valid = ~np.isnan(xs) & ~np.isnan(ys)
+            xs, ys = xs[valid], ys[valid]
+
+            if len(xs) < self.cfg.min_region_points:
+                continue
+
+            polygon = MultiPoint(list(zip(xs, ys))).convex_hull
+            centroid = polygon.centroid
+
+            records.append({
+                "category": category,
+                "region_id": region_id,
+                "num_points": len(xs),
+                "area": polygon.area,
+                "cent_lon": centroid.x,
+                "cent_lat": centroid.y,
+                "geometry": polygon,
+            })
+
+        return gpd.GeoDataFrame(records, crs="EPSG:4326")
+
+    def export_polygons_shapefile(self, gdf, category: str, output_dir: str) -> str:
+        """Write a polygon GeoDataFrame to `<output_dir>/<category>_polygon.shp`."""
+        os.makedirs(output_dir, exist_ok=True)
+        shp_path = os.path.join(output_dir, f"{category}_polygon.shp")
+        gdf.to_file(shp_path)
+        print(f"Wrote {len(gdf)} {category} polygons to {shp_path}")
+        return shp_path
+
+    def export_polygons_kml(self, gdf, category: str, output_dir: str) -> str:
+        """Write a polygon GeoDataFrame to `<output_dir>/<category>_polygon.kml`."""
+        os.makedirs(output_dir, exist_ok=True)
+        color_by_category = {"water": "steelblue", "intertidal": "darkorange"}
+        line_color = color_by_category.get(category, "steelblue")
+
+        kml = simplekml.Kml()
+        for _, row in gdf.iterrows():
+            geom = row.geometry
+            if geom is None or geom.is_empty:
+                continue
+
+            polys = [geom] if geom.geom_type == "Polygon" else list(geom.geoms)
+            for i, poly in enumerate(polys):
+                pol = kml.newpolygon(
+                    name=f"{category}_{row.region_id}" + (f"_{i}" if len(polys) > 1 else "")
+                )
+                pol.outerboundaryis = list(poly.exterior.coords)
+                if poly.interiors:
+                    pol.innerboundaryis = [list(ring.coords) for ring in poly.interiors]
+                pol.style.linestyle.color = getattr(simplekml.Color, line_color, None) or "ff1478b3"
+                pol.style.linestyle.width = 2
+                pol.style.polystyle.fill = 0
+
+        kml_path = os.path.join(output_dir, f"{category}_polygon.kml")
+        kml.save(kml_path)
+        print(f"Wrote {len(gdf)} {category} polygons to {kml_path}")
+        return kml_path
+
+    def export_bbox_kml(self, lon: np.ndarray, lat: np.ndarray,
+                         filepath: str, output_base: str,
+                         name: str = "SWOT PIXC Swath") -> str:
+        """Write a rectangular bounding-box KML around a cloud of lon/lat points.
+
+        Reusable version of the standalone "KML of the PIXC swath using a
+        Bounding Box" script: flattens the coordinates, drops NaNs/out-of-range/
+        duplicate points, takes the min/max lon/lat, and writes the resulting
+        rectangle as a single KML polygon. Handy for quickly drawing a rough
+        AOI box in Google Earth that can then be hand-edited into a tighter
+        polygon and fed back in via `subset_by_kml`.
+
+        The output goes to `<output_base>/<granule_name>/swath_bbox.kml`,
+        via `make_output_directory`, same convention as every other output
+        this class writes.
+
+        Parameters
+        ----------
+        lon, lat : array-like
+            Longitude/latitude values, any shape (will be flattened), e.g.
+            `arrays["lon"], arrays["lat"]` from `read_pixel_cloud_arrays`,
+            or `pixc_df["longitude"], pixc_df["latitude"]`.
+        filepath : str
+            Path to the source PIXC granule (used to name the output folder).
+        output_base : str
+            Base output directory; the granule-named subfolder is created
+            under this via `make_output_directory`.
+        name : str
+            Name label for the KML polygon placemark.
+        """
+        lon = np.asarray(lon).ravel()
+        lat = np.asarray(lat).ravel()
+
+        points = np.column_stack((lon, lat))
+        points = points[np.isfinite(points).all(axis=1)]
+        points = points[
+            (points[:, 0] >= -180) & (points[:, 0] <= 180) &
+            (points[:, 1] >= -90) & (points[:, 1] <= 90)
+        ]
+        points = np.unique(points, axis=0)
+
+        if len(points) < 4:
+            raise ValueError("Not enough valid points to build a swath boundary.")
+
+        min_lon, max_lon = points[:, 0].min(), points[:, 0].max()
+        min_lat, max_lat = points[:, 1].min(), points[:, 1].max()
+
+        boundary = np.array([
+            [min_lon, min_lat],
+            [max_lon, min_lat],
+            [max_lon, max_lat],
+            [min_lon, max_lat],
+            [min_lon, min_lat],
+        ])
+
+        kml = simplekml.Kml()
+        polygon = kml.newpolygon(name=name)
+        polygon.outerboundaryis = [(float(x), float(y)) for x, y in boundary]
+        polygon.style.linestyle.width = 3
+        polygon.style.polystyle.fill = 0
+
+        output_dir = self.make_output_directory(filepath, output_base)
+        output_path = os.path.join(output_dir, "swath_bbox.kml")
+        kml.save(output_path)
+
+        print(f"Boundary vertices: {len(boundary)}")
+        print(f"Longitude: {min_lon} {max_lon}")
+        print(f"Latitude: {min_lat} {max_lat}")
+        print(f"Saved bounding-box KML ({len(points)} pts) to {output_path}")
+        return output_path
+
+    def subset_by_kml(self, pixc_df: pd.DataFrame, kml_path: str,
+                       lon_col: str = "longitude",
+                       lat_col: str = "latitude") -> pd.DataFrame:
+        """Subset a pixel-cloud DataFrame to points that fall inside a KML polygon.
+
+        Reusable version of the standalone "mask PIXC points against a KML
+        boundary" script: reads the (first) geometry out of `kml_path` —
+        typically a polygon you drew/edited in Google Earth, or one produced
+        by `export_bbox_kml` — and keeps only the rows of `pixc_df` whose
+        (lon, lat) fall inside (or on the boundary of) that polygon.
+
+        Uses `shapely.vectorized` instead of a per-row `Point(...).covers()`
+        loop, which is dramatically faster on full pixel clouds (10^5-10^6 rows).
+
+        Parameters
+        ----------
+        pixc_df : pd.DataFrame
+            Pixel-cloud DataFrame, e.g. from `read_pixel_cloud`. Must have
+            `lon_col`/`lat_col` columns.
+        kml_path : str
+            Path to the boundary .kml (polygon or closed line string).
+        lon_col, lat_col : str
+            Column names holding longitude/latitude in `pixc_df`.
+
+        Returns
+        -------
+        pd.DataFrame
+            The subset of `pixc_df` inside the KML boundary (index reset).
+        """
+        kml_gdf = gpd.read_file(kml_path)
+        if kml_gdf.empty:
+            raise ValueError(f"No geometry found in {kml_path}.")
+
+        geom = kml_gdf.geometry.iloc[0]
+        if geom.geom_type == "LineString":
+            poly = Polygon(geom.coords)
+        elif geom.geom_type == "Polygon":
+            poly = geom
+        elif geom.geom_type in ("MultiPolygon", "GeometryCollection"):
+            poly = unary_union(list(geom.geoms))
+        else:
+            raise ValueError(f"Unsupported KML geometry type: {geom.geom_type}")
+
+        lon = pixc_df[lon_col].to_numpy(dtype=float)
+        lat = pixc_df[lat_col].to_numpy(dtype=float)
+
+        # contains + touches ~= shapely's covers() (interior OR boundary),
+        # but vectorized over the whole array instead of a Python loop.
+        mask = vectorized.contains(poly, lon, lat) | vectorized.touches(poly, lon, lat)
+
+        subset = pixc_df[mask].reset_index(drop=True)
+        print(f"Kept {int(mask.sum())}/{len(pixc_df)} points inside {kml_path}")
+        return subset
+
+    def rasterize_category_polygons(self, gdf, output_path: str,
+                                     resolution_deg: Optional[float] = None,
+                                     burn_value: int = 1) -> str:
+        """Burn a polygon GeoDataFrame into a single-band GeoTIFF using rasterio.
+
+        Useful for turning the water/intertidal polygons into a raster mask
+        (e.g. for overlaying on a DEM, or for further raster analysis).
+        """
+        resolution_deg = resolution_deg or self.cfg.raster_default_resolution_deg
+
+        if gdf is None or len(gdf) == 0:
+            raise ValueError("Cannot rasterize an empty GeoDataFrame.")
+
+        minx, miny, maxx, maxy = gdf.total_bounds
+        width = max(int(np.ceil((maxx - minx) / resolution_deg)), 1)
+        height = max(int(np.ceil((maxy - miny) / resolution_deg)), 1)
+        transform = from_bounds(minx, miny, maxx, maxy, width, height)
+
+        raster = rasterize(
+            [(geom, burn_value) for geom in gdf.geometry if geom is not None and not geom.is_empty],
+            out_shape=(height, width),
+            transform=transform,
+            fill=0,
+            dtype="uint8",
+        )
+
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        with rasterio.open(
+            output_path, "w",
+            driver="GTiff",
+            height=height, width=width, count=1,
+            dtype="uint8", crs="EPSG:4326", transform=transform,
+        ) as dst:
+            dst.write(raster, 1)
+
+        print(f"Wrote raster mask ({width}x{height}) to {output_path}")
+        return output_path
+
+    def sample_raster_at_points(self, raster_path: str,
+                                 lons: np.ndarray, lats: np.ndarray) -> np.ndarray:
+        """Sample a single-band raster (e.g. a DEM or the rasterized mask) at points."""
+        with rasterio.open(raster_path) as src:
+            values = np.array([v[0] for v in src.sample(zip(lons, lats))], dtype=float)
+        return values
+
+    def pixel_category_flat(self, arrays: dict, grids: dict) -> np.ndarray:
+        """Per-pixel category code in flat (original) pixel order.
+
+        0 = excluded (land or failed quality/classification), 1 = water,
+        2 = intertidal. Matches the category scheme used by
+        `plot_water_intertidal_mask`.
+        """
+        az, rg = arrays["az"], arrays["rg"]
+        classification = arrays["classification"]
+        az_min, rg_min = grids["az_min"], grids["rg_min"]
+
+        land_pixel = grids["land_grid_cleaned"][az - az_min, rg - rg_min]
+        not_land_pixel = ~land_pixel
+
+        quality = np.ones(classification.shape, dtype=bool)
+        for qual_name in self.cfg.quality_flag_names:
+            quality &= (arrays[qual_name] == 0)
+
+        water_pixel = quality & not_land_pixel & np.isin(classification, list(self.cfg.water_class_codes))
+        intertidal_pixel = quality & not_land_pixel & np.isin(classification, list(self.cfg.intertidal_class_codes))
+
+        category = np.zeros(classification.shape, dtype=int)
+        category[water_pixel] = 1
+        category[intertidal_pixel] = 2
+        return category
+
+    def plot_water_intertidal_mask(self, arrays: dict, grids: dict, ax=None):
+        """Scatter-plot water/intertidal pixels in lon/lat, in the same style
+        used for the classification scatter plots (discrete colormap +
+        labeled colorbar, cos-latitude aspect correction)."""
+        category = self.pixel_category_flat(arrays, grids)
+        lon, lat = arrays["lon"], arrays["lat"]
+        plot_valid = category > 0
+
+        class_labels = ["Water", "Intertidal"]
+        plot_colors = ["steelblue", "darkorange"]
+        cmap = mcolors.ListedColormap(plot_colors)
+        norm = mcolors.BoundaryNorm([0.5, 1.5, 2.5], cmap.N)
+
+        if ax is None:
+            plt.figure(figsize=(8, 8))
+            ax = plt.gca()
+
+        sc = ax.scatter(
+            lon[plot_valid], lat[plot_valid],
+            c=category[plot_valid], s=2, cmap=cmap, norm=norm,
+        )
+
+        cbar = plt.colorbar(sc, ax=ax, ticks=[1, 2])
+        cbar.set_label("Class")
+        cbar.set_ticklabels(class_labels)
+
+        ax.set_xlabel("Longitude")
+        ax.set_ylabel("Latitude")
+        ax.set_title("SWOT PIXC Water / Intertidal Mask")
+
+        mean_lat = np.deg2rad(np.mean(lat[plot_valid])) if np.any(plot_valid) else 0.0
+        ax.set_aspect(1 / np.cos(mean_lat))
+
+        plt.tight_layout()
+        return ax
+    
+    def make_output_directory(self, filepath: str, output_base: str) -> str:
+        """
+        Create an output directory based on the PIXC filename.
+
+        Example
+        -------
+        SWOT_L2_HR_PIXC_052_475_245R_20260706T065928_20260706T065939_PID0_01.nc
+
+        becomes
+
+        <output_base>/
+            052_475_245R_20260706T065928_20260706T065939_PID0_01/
+        """
+
+        stem = os.path.splitext(os.path.basename(filepath))[0]
+        prefix = "SWOT_L2_HR_PIXC_"
+        name = stem[len(prefix):] if stem.startswith(prefix) else stem
+        output_dir = os.path.join(output_base, name)
+        os.makedirs(output_dir, exist_ok=True)
+
+        return output_dir
+    def create_kml_subset(
+        self,
+        filepath: str,
+        kml_path: str,
+        output_base: str,
+        cycle: Optional[int] = None,
+        group: Optional[str] = None
+):
+        """
+        Read a PIXC file, subset it using a KML polygon,
+        save the subset to NetCDF, and return both the
+        subset DataFrame and the output filename.
+        """
+        output_dir = self.make_output_directory(filepath, output_base)
+
+        subset_file = os.path.join(output_dir, "subset.nc")
+
+        pixc = self.read_pixel_cloud(
+            filepath,
+            cycle=cycle,
+            group=group
+        )
+
+        subset = self.subset_by_kml(
+            pixc,
+            kml_path
+        )
+
+        xr.Dataset.from_dataframe(subset).to_netcdf(subset_file)
+
+        print(f"Subset written to {subset_file}")
+
+        return subset, subset_file, output_dir
+
+    def run_polygon_export_pipeline(self, filepath: str, output_base: str,
+                                     group: Optional[str] = None,
+                                     make_plot: bool = True,
+                                     make_rasters: bool = False,
+                                     raster_resolution_deg: Optional[float] = None) -> dict:
+        """End-to-end: read PIXC -> build masks -> export water/intertidal
+        polygons as shapefile + KML -> (optionally) rasterize -> (optionally) plot.
+
+        This is the reusable-pipeline equivalent of the standalone
+        "SWOT PIXC to polygons with KML" script. `output_dir` is derived from
+        `filepath`/`output_base` via `make_output_directory`, the same
+        directory convention used by `create_kml_subset`.
+        """
+        output_dir = self.make_output_directory(filepath, output_base)
+
+        arrays = self.read_pixel_cloud_arrays(filepath, group=group)
+        grids = self.build_land_water_intertidal_grids(arrays)
+
+        water_gdf = self.polygons_from_grid("water", self.cfg.water_class_codes, grids)
+        intertidal_gdf = self.polygons_from_grid("intertidal", self.cfg.intertidal_class_codes, grids)
+
+        result = {"arrays": arrays, "grids": grids, "water_gdf": water_gdf, "intertidal_gdf": intertidal_gdf}
+
+        for category, gdf in (("water", water_gdf), ("intertidal", intertidal_gdf)):
+            if gdf is None or len(gdf) == 0:
+                continue
+            result[f"{category}_shp"] = self.export_polygons_shapefile(gdf, category, output_dir)
+            result[f"{category}_kml"] = self.export_polygons_kml(gdf, category, output_dir)
+            if make_rasters:
+                raster_path = os.path.join(output_dir, f"{category}_mask.tif")
+                result[f"{category}_tif"] = self.rasterize_category_polygons(
+                    gdf, raster_path, resolution_deg=raster_resolution_deg
+                )
+
+        if make_plot:
+            self.plot_water_intertidal_mask(arrays, grids)
+            plt.show()
 
         return result
