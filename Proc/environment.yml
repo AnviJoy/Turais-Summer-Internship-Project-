@@ -1,0 +1,21 @@
+name: pipeline_class
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+    - python=3.12
+    - shapely
+    - numpy
+    - pandas
+    - rasterio
+    - xarray
+    - scipy 
+    - dataclasses
+    - typing
+    - affine
+    - scikit-image
+    - simplekml
+    - matplotlib
+    - geopandas
+    - netcdf4
+    - h5netcdf
