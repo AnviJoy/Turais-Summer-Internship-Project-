@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Sequence
 import numpy as np
 import pandas as pd
+import shapely
 from scipy import stats
 import xarray as xr
 from rasterio.features import shapes as _rio_shapes
@@ -17,7 +18,7 @@ except ImportError:
     _coverage_union_all = None
 from shapely.geometry import Point
 from shapely import vectorized
-from skimage.morphology import remove_small_objects, binary_closing, disk
+from skimage.morphology import remove_small_objects, closing as binary_closing, disk
 from scipy.ndimage import binary_fill_holes
 from shapely.geometry import MultiPoint
 import geopandas as gpd
@@ -35,38 +36,58 @@ import matplotlib.colors as mcolors
 class SWOTPipelineConfig:
     """Tunable thresholds for the pipeline, defaults from the paper's pseudocode."""
 
+    # pixels with sigma phase noise above this value are dropped as unreliable
     sigma_phase_noise_threshold: float = 0.08
+    # buffer size around the reference open water point used to compute its median height
     ref_point_buffer_deg: float = 0.001
+    # bin width (m) for the height anomaly pdf
     pdf_bin_width_m: float = 0.05
+    # minimum pdf density for a bump to count as a real peak
     pdf_peak_min_density: float = 0.10
+    # maximum number of bins allowed when building the pdf
     pdf_max_bins: int = 2000
+    # max number of points used to fit the kde; larger sets get randomly subsampled
     kde_max_samples: Optional[int] = 50_000
+    # random seed used for that subsampling, so results are repeatable
     kde_random_seed: Optional[int] = 0
+    # how far the pdf must drop as a fraction of the peak to set the upper cutoff
     eps_up_fraction: float = 0.01
-    eps_low_divisor: float = 50.0
+    # divisor used to set the near-zero threshold when finding the lower cutoff
+    #original: 50.0
+    eps_low_divisor: float = 100.0
+    # grid cell size (degrees) used to build the water extent mask
     mask_grid_res_deg: float = 0.0001
+    # minimum validity quantile a grid cell needs to count as water
     mask_validity_quantile: float = 0.90
+    # radius used to close small gaps in the water mask before finding regions
     mask_closing_disk_radius: int = 2
+    # smallest blob size (in cells) kept after cleaning the water mask
     mask_min_object_size: int = 8
+    # connectivity rule used when grouping mask cells into regions
     mask_connectivity: int = 2
+    # radius used to close gaps between scattered pixels before clustering them into polygons
+    cluster_closing_disk_radius: int = 4
+    # grid cell size (degrees) for the final aggregated output
     output_grid_res_deg: float = 0.00025
+    # number of Monte Carlo samples drawn per grid cell
     mc_realizations: int = 1000
+    # tail probability used to compute the confidence interval
     mc_ci_alpha: float = 0.025
+    # whether to remove pixels classified as dark water
     exclude_dark_water: bool = False
+    # smallest hole area (square degrees) kept when cleaning a polygon
     min_hole_area_deg2: float = 1e-8
+    # window size used to smooth a polygon's boundary
     smoothing_window: int = 5
 
+    # raw values this large or bigger are treated as missing data
     fill_value_threshold: float = 1e30
 
-    # Placeholders — confirm against the PDD/ATBD classification table.
+    # placeholders — confirm against the PDD/ATBD classification table.
     open_water_class_codes: tuple = (3, 4)
     dark_water_class_codes: tuple = (5, 6)
 
-    # --- Added: classification codes / grid settings used by the
-    # az/range grid + polygon-export methods (read_pixel_cloud_arrays,
-    # build_land_water_intertidal_grids, polygons_from_grid,
-    # run_polygon_export_pipeline). Values match what Polygon.py used
-    # to hardcode — confirm against the PDD/ATBD table like the codes above.
+    # classification codes / grid settings 
     land_class_code: int = 1
     water_class_codes: tuple = (4,)
     intertidal_class_codes: tuple = (2, 3)
@@ -490,12 +511,41 @@ class SWOTIntertidalPipeline:
         coords = np.array(cleaned.exterior.coords)
         w = self.cfg.smoothing_window
         if w > 1 and len(coords) > w:
+            # `coords` is a closed ring (first point == last point). A plain
+            # np.convolve(..., mode="same") zero-pads both ends as if the
+            # curve were open, which distorts the boundary right at the
+            # seam and can leave the smoothed ring self-intersecting
+            # (invalid). Pad circularly instead so the smoothing wraps
+            # around the closure, then re-close the ring explicitly.
+            pad = w // 2
+            open_coords = coords[:-1]  # drop duplicated closing point
+            padded = np.vstack([open_coords[-pad:], open_coords, open_coords[:pad]]) \
+                if pad > 0 else open_coords
             kernel = np.ones(w) / w
-            smoothed = np.column_stack([
-                np.convolve(coords[:, 0], kernel, mode="same"),
-                np.convolve(coords[:, 1], kernel, mode="same"),
+            smoothed_open = np.column_stack([
+                np.convolve(padded[:, 0], kernel, mode="same")[pad:pad + len(open_coords)],
+                np.convolve(padded[:, 1], kernel, mode="same")[pad:pad + len(open_coords)],
             ])
-            cleaned = Polygon(smoothed, kept_interiors)
+            smoothed = np.vstack([smoothed_open, smoothed_open[:1]])  # re-close ring
+            candidate = Polygon(smoothed, kept_interiors)
+            if candidate.is_valid and not candidate.is_empty:
+                cleaned = candidate
+            else:
+                # Smoothing produced a self-intersecting ring; repair it
+                # rather than silently handing an invalid geometry
+                # downstream (contains() checks against invalid polygons
+                # can be pathologically slow / appear to hang).
+                repaired = candidate.buffer(0)
+                if not repaired.is_empty:
+                    if isinstance(repaired, MultiPolygon):
+                        repaired = max(repaired.geoms, key=lambda p: p.area)
+                    cleaned = repaired
+                # else: keep the pre-smoothing `cleaned` polygon as a fallback
+
+        if not cleaned.is_valid:
+            cleaned = cleaned.buffer(0)
+            if isinstance(cleaned, MultiPolygon):
+                cleaned = max(cleaned.geoms, key=lambda p: p.area)
 
         return cleaned
 
@@ -507,11 +557,155 @@ class SWOTIntertidalPipeline:
             raise ValueError("No water_extent_mask provided or cached; "
                               "call build_water_extent_mask first.")
 
+        if not mask_polygon.is_valid:
+            # Point-in-polygon tests against an invalid (e.g. self-
+            # intersecting) polygon can be pathologically slow in GEOS,
+            # which looks like a hang rather than an error. Repair first.
+            warnings.warn("water_extent_mask is invalid; repairing with buffer(0) "
+                           "before running containment checks.")
+            repaired = mask_polygon.buffer(0)
+            if isinstance(repaired, MultiPolygon):
+                repaired = max(repaired.geoms, key=lambda p: p.area)
+            mask_polygon = repaired
+
         df = candidates_df.copy()
         inside = vectorized.contains(mask_polygon, df["longitude"].to_numpy(),
                                       df["latitude"].to_numpy())
 
         return df[inside].reset_index(drop=True)
+
+    def cluster_points_to_polygons(self, df: pd.DataFrame, category: str,
+                                    grid_res_deg: Optional[float] = None,
+                                    min_region_points: Optional[int] = None,
+                                    concave_hull_ratio: float = 0.1,
+                                    connectivity: int = 2,
+                                    closing_disk_radius: Optional[int] = None) -> gpd.GeoDataFrame:
+        """Split a scattered lon/lat point set into spatially connected
+        clusters and return one (concave-hull) polygon per cluster.
+
+        This is the DataFrame-pathway analogue of `polygons_from_grid` /
+        the clustering step inside `build_water_extent_mask` (Fig. 4 of the
+        paper): points are rasterized onto a regular grid, connected grid
+        cells are labelled as separate regions (scipy.ndimage.label), and
+        each region's points get their own hull. Feeding every point from
+        the whole scene into a single `shapely.concave_hull()` call instead
+        collapses all spatially separate patches into one connected
+        boundary, which is the "one big polygon instead of several
+        separate ones" symptom.
+
+        Parameters
+        ----------
+        df : DataFrame with 'longitude'/'latitude' columns (e.g. water_pixels
+            or intertidal_pixels).
+        category : label stored in the output GeoDataFrame's 'category' column.
+        grid_res_deg : rasterization resolution; defaults to cfg.mask_grid_res_deg.
+            Real L2_HR_PIXC pixel spacing (~10-70 m across-track, ~20 m
+            along-track) is often coarser than this, so consecutive real
+            pixels can land in non-adjacent grid cells and get split into
+            spurious separate clusters unless `closing_disk_radius` bridges
+            the gap (see below).
+        min_region_points : clusters smaller than this are dropped as noise;
+            defaults to cfg.min_region_points.
+        concave_hull_ratio : passed to shapely.concave_hull per cluster
+            (0 = tightest hull, 1 = convex hull).
+        connectivity : 1 = 4-connectivity, 2 = 8-connectivity between grid cells.
+        closing_disk_radius : binary_closing disk radius (in grid cells)
+            applied to the occupancy grid before labeling connected
+            components, same technique used in `build_water_extent_mask`.
+            Bridges small gaps caused by irregular real pixel spacing so
+            a single water body isn't fragmented into many tiny clusters.
+            Defaults to cfg.cluster_closing_disk_radius. Set to 0 to disable.
+        """
+        grid_res_deg = grid_res_deg or self.cfg.mask_grid_res_deg
+        min_region_points = (min_region_points if min_region_points is not None
+                              else self.cfg.min_region_points)
+        closing_disk_radius = (closing_disk_radius if closing_disk_radius is not None
+                                else self.cfg.cluster_closing_disk_radius)
+
+        empty = gpd.GeoDataFrame(
+            columns=["category", "region_id", "num_points", "area",
+                     "cent_lon", "cent_lat", "geometry"],
+            geometry="geometry", crs="EPSG:4326",
+        )
+        if len(df) == 0:
+            return empty
+
+        lon = df["longitude"].to_numpy()
+        lat = df["latitude"].to_numpy()
+
+        lat_min, lat_max = lat.min(), lat.max()
+        lon_min, lon_max = lon.min(), lon.max()
+        lat_bins = np.arange(lat_min, lat_max + grid_res_deg, grid_res_deg)
+        lon_bins = np.arange(lon_min, lon_max + grid_res_deg, grid_res_deg)
+        if len(lat_bins) < 2 or len(lon_bins) < 2:
+            lat_bins = np.array([lat_min, lat_min + grid_res_deg])
+            lon_bins = np.array([lon_min, lon_min + grid_res_deg])
+
+        row = np.clip(np.digitize(lat, lat_bins) - 1, 0, len(lat_bins) - 2)
+        col = np.clip(np.digitize(lon, lon_bins) - 1, 0, len(lon_bins) - 2)
+
+        occ = np.zeros((len(lat_bins) - 1, len(lon_bins) - 1), dtype=bool)
+        occ[row, col] = True
+
+        if closing_disk_radius and closing_disk_radius > 0:
+            # Bridge gaps between real pixels that are physically part of
+            # the same water body but whose spacing skips grid cells.
+            # binary_closing (dilate then erode) connects nearby occupied
+            # cells without merging genuinely distant, unrelated clusters.
+            occ_for_labeling = binary_closing(occ, disk(closing_disk_radius))
+        else:
+            occ_for_labeling = occ
+
+        structure = np.ones((3, 3)) if connectivity == 2 else None
+        labelled, num_features = label(occ_for_labeling, structure=structure)
+        point_labels = labelled[row, col]
+
+        # Group point indices by cluster label in one pass instead of
+        # looping `region_id in range(1, num_features+1)` and rescanning
+        # the full point array each time (O(num_clusters x n_points),
+        # which explodes when there are many small/noisy clusters).
+        order = np.argsort(point_labels, kind="stable")
+        sorted_labels = point_labels[order]
+        unique_labels, start_idx, counts = np.unique(
+            sorted_labels, return_index=True, return_counts=True
+        )
+
+        records = []
+        for region_id, start, n in zip(unique_labels, start_idx, counts):
+            if region_id == 0:
+                continue  # background, shouldn't occur but guard anyway
+            n = int(n)
+            if n < min_region_points:
+                continue
+
+            idx = order[start:start + n]
+            xs, ys = lon[idx], lat[idx]
+            if n >= 3:
+                try:
+                    hull = shapely.concave_hull(
+                        MultiPoint(list(zip(xs, ys))), ratio=concave_hull_ratio
+                    )
+                except Exception:
+                    hull = MultiPoint(list(zip(xs, ys))).convex_hull
+            else:
+                hull = MultiPoint(list(zip(xs, ys))).convex_hull
+
+            if hull.is_empty:
+                continue
+            centroid = hull.centroid
+            records.append({
+                "category": category,
+                "region_id": int(region_id),
+                "num_points": n,
+                "area": hull.area,
+                "cent_lon": centroid.x,
+                "cent_lat": centroid.y,
+                "geometry": hull,
+            })
+
+        if not records:
+            return empty
+        return gpd.GeoDataFrame(records, crs="EPSG:4326")
 
     def check_reference_point_classification(self, pixc_df: pd.DataFrame) -> bool:
         """Warn if the cached reference pixel looks like dark water."""
