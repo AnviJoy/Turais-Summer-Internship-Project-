@@ -1,4 +1,5 @@
 import os
+import rasterio
 import time
 import numpy as np
 import matplotlib.pyplot as plt
@@ -103,14 +104,22 @@ _t("build_water_extent_mask")
 pipe.plot_step(water_extent_mask, "step5a_water_extent_mask", output_dir,
                title="Step 5a: Water Extent Mask")
 
+_t = _step_timer()
+print(f"    water_extent_mask.is_valid = {water_extent_mask.is_valid}, "
+      f"n_exterior_coords = {len(water_extent_mask.exterior.coords)}")
 intertidal_pixels = pipe.apply_water_extent_mask(candidates, water_extent_mask)
+_t("apply_water_extent_mask")
 print(f"Step 5b - apply_water_extent_mask: {len(intertidal_pixels)} final "
       f"intertidal pixels")
+_t = _step_timer()
 pipe.plot_step(intertidal_pixels, "step5b_apply_water_extent_mask", output_dir,
                value_col="h_a", title="Step 5b: Final Intertidal Pixels")
+_t("plot_step (step5b)")
 
 
+_t = _step_timer()
 intertidal_pixels = pipe.estimate_pixel_uncertainty(intertidal_pixels)
+_t("estimate_pixel_uncertainty")
 
 
 # polygons
@@ -118,28 +127,19 @@ intertidal_pixels = pipe.estimate_pixel_uncertainty(intertidal_pixels)
 h_a_lower = candidates.attrs["h_a_lower"]
 water_pixels = filtered[filtered["h_a"] < h_a_lower].reset_index(drop=True)
 
-water_hull = shapely.concave_hull(
-    MultiPoint(list(zip(water_pixels["longitude"], water_pixels["latitude"]))),
-    ratio=concave_hull_ratio,
+# Cluster points into spatially connected groups first 
+_t = _step_timer()
+water_gdf = pipe.cluster_points_to_polygons(
+    water_pixels, "water", concave_hull_ratio=concave_hull_ratio
 )
-water_gdf = gpd.GeoDataFrame(
-    [{"category": "water", "region_id": 1, "num_points": len(water_pixels),
-      "area": water_hull.area, "cent_lon": water_hull.centroid.x, "cent_lat": water_hull.centroid.y,
-      "geometry": water_hull}],
-    crs="EPSG:4326",
-)
+_t("cluster_points_to_polygons (water)")
 print(f"Water polygons: {len(water_gdf)}")
 
-intertidal_hull = shapely.concave_hull(
-    MultiPoint(list(zip(intertidal_pixels["longitude"], intertidal_pixels["latitude"]))),
-    ratio=concave_hull_ratio,
+_t = _step_timer()
+intertidal_gdf = pipe.cluster_points_to_polygons(
+    intertidal_pixels, "intertidal", concave_hull_ratio=concave_hull_ratio
 )
-intertidal_gdf = gpd.GeoDataFrame(
-    [{"category": "intertidal", "region_id": 1, "num_points": len(intertidal_pixels),
-      "area": intertidal_hull.area, "cent_lon": intertidal_hull.centroid.x, "cent_lat": intertidal_hull.centroid.y,
-      "geometry": intertidal_hull}],
-    crs="EPSG:4326",
-)
+_t("cluster_points_to_polygons (intertidal)")
 print(f"Intertidal polygons (from filtered pixels only): {len(intertidal_gdf)}")
 
 
