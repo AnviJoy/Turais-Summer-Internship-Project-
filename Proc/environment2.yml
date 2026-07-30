@@ -1,0 +1,19 @@
+name: pipeline_2
+channels:
+  - conda-forge
+channel_priority: strict
+dependencies:
+    - python=3.12
+    - shapely
+    - numpy
+    - pandas
+    - rasterio
+    - xarray
+    - scipy
+    - affine
+    - scikit-image
+    - simplekml
+    - matplotlib
+    - geopandas
+    - netcdf4
+    - h5netcdf
