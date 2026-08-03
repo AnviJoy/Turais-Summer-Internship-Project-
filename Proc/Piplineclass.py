@@ -37,6 +37,7 @@ class SWOTPipelineConfig:
     """Tunable thresholds for the pipeline, defaults from the paper's pseudocode."""
 
     # pixels with sigma phase noise above this value are dropped as unreliable
+    #original: 0.08
     sigma_phase_noise_threshold: float = 0.08
     # buffer size around the reference open water point used to compute its median height
     ref_point_buffer_deg: float = 0.001
@@ -54,12 +55,13 @@ class SWOTPipelineConfig:
     eps_up_fraction: float = 0.01
     # divisor used to set the near-zero threshold when finding the lower cutoff
     #original: 50.0
-    eps_low_divisor: float = 100.0
+    eps_low_divisor: float = 50.0
     # grid cell size (degrees) used to build the water extent mask
     mask_grid_res_deg: float = 0.0001
     # minimum validity quantile a grid cell needs to count as water
     mask_validity_quantile: float = 0.90
     # radius used to close small gaps in the water mask before finding regions
+    #original: 2
     mask_closing_disk_radius: int = 2
     # smallest blob size (in cells) kept after cleaning the water mask
     mask_min_object_size: int = 8
@@ -78,6 +80,7 @@ class SWOTPipelineConfig:
     # smallest hole area (square degrees) kept when cleaning a polygon
     min_hole_area_deg2: float = 1e-8
     # window size used to smooth a polygon's boundary
+    #original: 5
     smoothing_window: int = 5
 
     # raw values this large or bigger are treated as missing data
@@ -123,7 +126,9 @@ class SWOTPipelineConfig:
         "pole_tide": ["pole_tide"],
     })
 
-    subset = r"C:\Users\pmalesza\Documents\SWOT kml\subset.kml"
+    #subset = r"C:\Users\pmalesza\Documents\SWOT kml\subset.kml"
+    
+    subset = r"C:\Users\pmalesza\Documents\SWOT kml\new_small_subset.kml"
 
 class SWOTIntertidalPipeline:
     """SWOT L2_HR_PIXC to intertidal topography pipeline, following the paper's method."""
@@ -409,6 +414,7 @@ class SWOTIntertidalPipeline:
         """Return candidate non-open-water pixels (h_a within the Step 4 cutoffs)."""
         h_a = pixc_df["h_a"].to_numpy()
         grid, pdf, _ = self._kde_pdf(h_a)
+        
 
         peaks_idx = self.find_pdf_peaks(grid, pdf)
         if peaks_idx.size == 0:
