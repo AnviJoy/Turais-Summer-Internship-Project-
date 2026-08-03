@@ -37,8 +37,8 @@ print("Output directory:", output_dir)
 # read pixel cloud as a flat DataFrame, draw the swath boundary, and subset to it
 pixc_full = pipe.read_pixel_cloud(file, cycle)
 print("Step 1 - read_pixel_cloud:", pixc_full.shape)
-pipe.plot_step(pixc_full, "step1_read_pixel_cloud", output_dir,
-               value_col="sigma_phase_noise", title="Step 1: Read Pixel Cloud")
+#pipe.plot_step(pixc_full, "step1_read_pixel_cloud", output_dir,
+               #value_col="sigma_phase_noise", title="Step 1: Read Pixel Cloud")
 
 
 kml_path = pipe.export_bbox_kml(pixc_full["longitude"], pixc_full["latitude"],
@@ -48,9 +48,10 @@ print(f"Step 1b - export_bbox_kml: wrote boundary KML to {kml_path}")
 
 pixc = pipe.subset_by_kml(pixc_full, cfg.subset)
 print(f"Step 1c - subset_by_kml: {len(pixc)} / {len(pixc_full)} pixels kept")
-pipe.plot_step(pixc, "step1c_subset_by_kml", output_dir,
-               value_col="sigma_phase_noise", title="Step 1c: Subset by Swath Boundary")
+#pipe.plot_step(pixc, "step1c_subset_by_kml", output_dir,
+               #value_col="sigma_phase_noise", title="Step 1c: Subset by Swath Boundary")
 
+#print(pipe.estimate_phase_noise_threshold(pixc))  
 
 # height anomaly
 
@@ -64,8 +65,8 @@ if ref_lat is None or ref_lon is None:
 
 pixc = pipe.compute_height_anomaly(pixc, ref_lat, ref_lon)
 print("Step 2 - compute_height_anomaly: added h_a column")
-pipe.plot_step(pixc, "step2_height_anomaly", output_dir,
-               value_col="h_a", title="Step 2: Height Anomaly (h_a)")
+#pipe.plot_step(pixc, "step2_height_anomaly", output_dir,
+               #value_col="h_a", title="Step 2: Height Anomaly (h_a)")
 
 pipe.check_reference_point_classification(pixc)
 if not pipe.cycle_has_reliable_xover(pixc):
@@ -78,8 +79,8 @@ pixc = pipe.filter_dark_water(pixc)
 # phase noise filter
 filtered = pipe.filter_phase_noise(pixc)
 print(f"Step 3 - filter_phase_noise: {len(filtered)} / {len(pixc)} pixels kept")
-pipe.plot_step(filtered, "step3_filter_phase_noise", output_dir,
-               value_col="h_a", title="Step 3: Phase-Noise Filtered Pixels")
+#pipe.plot_step(filtered, "step3_filter_phase_noise", output_dir,
+               #value_col="h_a", title="Step 3: Phase-Noise Filtered Pixels")
 
 
 # PDF-based open water filter to candidate intertidal+land pixels
@@ -87,11 +88,11 @@ pipe.plot_step(filtered, "step3_filter_phase_noise", output_dir,
 _t = _step_timer()
 candidates = pipe.filter_open_water(filtered)
 print(f"Step 4 - filter_open_water: {len(candidates)} candidate pixels "
-      f"(h_a_lower={candidates.attrs['h_a_lower']:.4f}, "
+      f"(h_a_lower={candidates.attrs['h_a_lower']:.4f},"
       f"h_a_upper={candidates.attrs['h_a_upper']:.4f})")
 _t("filter_open_water / KDE")
-pipe.plot_step(candidates, "step4_filter_open_water", output_dir,
-               value_col="h_a", title="Step 4: Open-Water Filtered Candidates")
+#pipe.plot_step(candidates, "step4_filter_open_water", output_dir,
+               #value_col="h_a", title="Step 4: Open-Water Filtered Candidates")
 
 
 # water extent mask, applied to the candidates, pixels that are the actual fully filtered intertidal set for this cycle
@@ -101,8 +102,8 @@ water_extent_mask = pipe.build_water_extent_mask([filtered])
 print(f"Step 5a - build_water_extent_mask: polygon area="
       f"{water_extent_mask.area:.8f} deg^2, bounds={water_extent_mask.bounds}")
 _t("build_water_extent_mask")
-pipe.plot_step(water_extent_mask, "step5a_water_extent_mask", output_dir,
-               title="Step 5a: Water Extent Mask")
+#pipe.plot_step(water_extent_mask, "step5a_water_extent_mask", output_dir,
+              # title="Step 5a: Water Extent Mask")
 
 _t = _step_timer()
 print(f"    water_extent_mask.is_valid = {water_extent_mask.is_valid}, "
@@ -112,8 +113,8 @@ _t("apply_water_extent_mask")
 print(f"Step 5b - apply_water_extent_mask: {len(intertidal_pixels)} final "
       f"intertidal pixels")
 _t = _step_timer()
-pipe.plot_step(intertidal_pixels, "step5b_apply_water_extent_mask", output_dir,
-               value_col="h_a", title="Step 5b: Final Intertidal Pixels")
+#pipe.plot_step(intertidal_pixels, "step5b_apply_water_extent_mask", output_dir,
+               #value_col="h_a", title="Step 5b: Final Intertidal Pixels")
 _t("plot_step (step5b)")
 
 
@@ -190,4 +191,5 @@ if "intertidal" in shapefile_paths:
     print(check_gdf[["num_points", "area", "cent_lon", "cent_lat"]])
 
 print("\nDone.")
+
 
