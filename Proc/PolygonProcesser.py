@@ -10,7 +10,7 @@ import geopandas as gpd
 from Piplineclass import SWOTIntertidalPipeline, SWOTPipelineConfig
 
 
-file = r"C:\Users\Lily Donaldson\Documents\Anvi\Python Codes\SWOT_L2_HR_PIXC_052_475_245R_20260706T065928_20260706T065939_PID0_01.nc"
+file = r"C:\Users\Lily Donaldson\Documents\Anvi\Python Codes\SWOT_L2_HR_PIXC_053_348_073L_20260722T142201_20260722T142213_PID0_01.nc"
 
 #r"C:\Users\pmalesza\Documents\Python Codes\SWOT_L2_HR_PIXC_052_475_245R_20260706T065928_20260706T065939_PID0_01.nc"
 
@@ -39,29 +39,18 @@ output_dir = pipe.make_output_directory(file, output_base)
 print("Output directory:", output_dir)
 
 
-# read pixel cloud as a flat DataFrame, draw the swath boundary, and subset to it
+# read pixel cloud as a flat DataFrame
 pixc_full = pipe.read_pixel_cloud(file, cycle)
 print("Step 1 - read_pixel_cloud:", pixc_full.shape)
 #pipe.plot_step(pixc_full, "step1_read_pixel_cloud", output_dir,
                #value_col="sigma_phase_noise", title="Step 1: Read Pixel Cloud")
 
 
-# build a coastal-corridor mask from the UK coastline KML (buffered
-# `coastline_buffer_km` either side, configurable in SWOTPipelineConfig),
-# clip it to this pass's swath extent, and use that as the subset area
-coastal_subset_kml = pipe.make_coastal_subset_kml(
-    file, output_base,
-    pixc_full["longitude"], pixc_full["latitude"],
-    coastline_kml_path=cfg.coastline_kml_path,
-    buffer_km=cfg.coastline_buffer_km,
-)
-print(f"Step 1b - make_coastal_subset_kml: wrote coastal subset KML to {coastal_subset_kml} "
-      f"(buffer = {cfg.coastline_buffer_km} km)")
-
-pixc = pipe.subset_by_kml(pixc_full, coastal_subset_kml)
-print(f"Step 1c - subset_by_kml: {len(pixc)} / {len(pixc_full)} pixels kept")
-#pipe.plot_step(pixc, "step1c_subset_by_kml", output_dir,
-               #value_col="sigma_phase_noise", title="Step 1c: Subset by Swath Boundary")
+# subset straight to the France KML polygon defined in cfg.subset
+pixc = pipe.subset_by_kml(pixc_full, cfg.subset)
+print(f"Step 1b - subset_by_kml (france_subset): {len(pixc)} / {len(pixc_full)} pixels kept")
+#pipe.plot_step(pixc, "step1b_subset_by_kml", output_dir,
+               #value_col="sigma_phase_noise", title="Step 1b: Subset by France KML")
 
 #print(pipe.estimate_phase_noise_threshold(pixc))  
 
