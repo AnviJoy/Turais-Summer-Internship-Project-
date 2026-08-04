@@ -1,8 +1,13 @@
 import matplotlib.pyplot as plt
 from Piplineclass import SWOTIntertidalPipeline, SWOTPipelineConfig
 
-file = r"C:\Users\pmalesza\Documents\Python Codes\SWOT_L2_HR_PIXC_052_475_245R_20260706T065928_20260706T065939_PID0_01.nc"
-output_base = r"C:\Users\pmalesza\Documents\SWOT_L2_HR_PIXC Output Polygons"
+file = r"C:\Users\Lily Donaldson\Documents\Anvi\Python Codes\SWOT_L2_HR_PIXC_052_475_245R_20260706T065928_20260706T065939_PID0_01.nc"
+
+#r"C:\Users\pmalesza\Documents\Python Codes\SWOT_L2_HR_PIXC_052_475_245R_20260706T065928_20260706T065939_PID0_01.nc"
+
+output_base = r"C:\Users\Lily Donaldson\Documents\Anvi\SWOT_L2_HR_PIXC Output Polygons"
+
+#r"C:\Users\pmalesza\Documents\SWOT_L2_HR_PIXC Output Polygons"
 cycle = 52
 
 cfg = SWOTPipelineConfig()
