@@ -68,6 +68,7 @@ class SWOTPipelineConfig:
     # connectivity rule used when grouping mask cells into regions
     mask_connectivity: int = 2
     # radius used to close gaps between scattered pixels before clustering them into polygons
+    #original:4
     cluster_closing_disk_radius: int = 4
     # grid cell size (degrees) for the final aggregated output
     output_grid_res_deg: float = 0.00025
@@ -128,7 +129,15 @@ class SWOTPipelineConfig:
 
     #subset = r"C:\Users\pmalesza\Documents\SWOT kml\subset.kml"
     
-    subset = r"C:\Users\pmalesza\Documents\SWOT kml\new_small_subset.kml"
+    #subset = r"C:\Users\pmalesza\Documents\SWOT kml\new_small_subset.kml"
+
+    # UK coastline reference line (KML), used to build a coastal buffer mask
+    coastline_kml_path: str = r"C:\Users\Lily Donaldson\Documents\Anvi\SWOT kml\UK_coastline_500m_accuracy.kml"
+    #r"C:\Users\pmalesza\Documents\SWOT kml\UK_coastline_500m_accuracy.kml"
+    # distance (km) either side of the coastline kept as the coastal corridor mask
+    coastline_buffer_km: float = 5.0
+    # projected CRS used when buffering the coastline so the buffer distance is in real metres
+    coastline_projected_crs: str = "EPSG:27700"
 
 class SWOTIntertidalPipeline:
     """SWOT L2_HR_PIXC to intertidal topography pipeline, following the paper's method."""
@@ -588,39 +597,6 @@ class SWOTIntertidalPipeline:
                                     closing_disk_radius: Optional[int] = None) -> gpd.GeoDataFrame:
         """Split a scattered lon/lat point set into spatially connected
         clusters and return one (concave-hull) polygon per cluster.
-
-        This is the DataFrame-pathway analogue of `polygons_from_grid` /
-        the clustering step inside `build_water_extent_mask` (Fig. 4 of the
-        paper): points are rasterized onto a regular grid, connected grid
-        cells are labelled as separate regions (scipy.ndimage.label), and
-        each region's points get their own hull. Feeding every point from
-        the whole scene into a single `shapely.concave_hull()` call instead
-        collapses all spatially separate patches into one connected
-        boundary, which is the "one big polygon instead of several
-        separate ones" symptom.
-
-        Parameters
-        ----------
-        df : DataFrame with 'longitude'/'latitude' columns (e.g. water_pixels
-            or intertidal_pixels).
-        category : label stored in the output GeoDataFrame's 'category' column.
-        grid_res_deg : rasterization resolution; defaults to cfg.mask_grid_res_deg.
-            Real L2_HR_PIXC pixel spacing (~10-70 m across-track, ~20 m
-            along-track) is often coarser than this, so consecutive real
-            pixels can land in non-adjacent grid cells and get split into
-            spurious separate clusters unless `closing_disk_radius` bridges
-            the gap (see below).
-        min_region_points : clusters smaller than this are dropped as noise;
-            defaults to cfg.min_region_points.
-        concave_hull_ratio : passed to shapely.concave_hull per cluster
-            (0 = tightest hull, 1 = convex hull).
-        connectivity : 1 = 4-connectivity, 2 = 8-connectivity between grid cells.
-        closing_disk_radius : binary_closing disk radius (in grid cells)
-            applied to the occupancy grid before labeling connected
-            components, same technique used in `build_water_extent_mask`.
-            Bridges small gaps caused by irregular real pixel spacing so
-            a single water body isn't fragmented into many tiny clusters.
-            Defaults to cfg.cluster_closing_disk_radius. Set to 0 to disable.
         """
         grid_res_deg = grid_res_deg or self.cfg.mask_grid_res_deg
         min_region_points = (min_region_points if min_region_points is not None
@@ -1166,6 +1142,127 @@ class SWOTIntertidalPipeline:
         subset = pixc_df[mask].reset_index(drop=True)
         print(f"Kept {int(mask.sum())}/{len(pixc_df)} points inside {kml_path}")
         return subset
+
+    def build_coastline_buffer_mask(
+        self,
+        coastline_kml_path: Optional[str] = None,
+        buffer_km: Optional[float] = None,
+        projected_crs: Optional[str] = None,
+    ) -> gpd.GeoDataFrame:
+        """Read a coastline KML (one or more lines) and build a polygon mask
+        extending `buffer_km` kilometres either side of the coastline.
+
+        The buffer is computed in a projected (metric) CRS so that
+        `buffer_km` is a real distance, then reprojected back to WGS84.
+        Returns a single-row GeoDataFrame (EPSG:4326) holding the
+        (Multi)Polygon mask; also cached on `self._coastline_mask`.
+        """
+        coastline_kml_path = coastline_kml_path or self.cfg.coastline_kml_path
+        buffer_km = buffer_km if buffer_km is not None else self.cfg.coastline_buffer_km
+        projected_crs = projected_crs or self.cfg.coastline_projected_crs
+
+        if not coastline_kml_path:
+            raise ValueError(
+                "No coastline_kml_path given and none configured "
+                "(cfg.coastline_kml_path)."
+            )
+
+        coast_gdf = gpd.read_file(coastline_kml_path)
+        if coast_gdf.empty:
+            raise ValueError(f"No geometry found in {coastline_kml_path}.")
+
+        if coast_gdf.crs is None:
+            coast_gdf = coast_gdf.set_crs("EPSG:4326")
+
+        # project to a metric CRS so the buffer distance is in real km
+        coast_proj = coast_gdf.to_crs(projected_crs)
+
+        buffer_m = buffer_km * 1000.0
+        buffered = coast_proj.geometry.buffer(buffer_m)
+        merged = unary_union(buffered.values)
+
+        mask_gdf = gpd.GeoDataFrame(geometry=[merged], crs=projected_crs).to_crs("EPSG:4326")
+
+        self._coastline_mask = mask_gdf
+        print(
+            f"Built coastline buffer mask: {buffer_km:.2f} km either side of "
+            f"{len(coast_gdf)} coastline feature(s) in {coastline_kml_path}"
+        )
+        return mask_gdf
+
+    def subset_kml_to_swath(
+        self,
+        mask_gdf: gpd.GeoDataFrame,
+        swath_kml_path: str,
+        output_path: str,
+        name: str = "Coastal subset",
+    ) -> str:
+        """Intersect a mask polygon (e.g. the buffered coastline) with the
+        SWOT swath bounding-box KML, and save the resulting subset polygon
+        to a new KML at `output_path`."""
+        swath_gdf = gpd.read_file(swath_kml_path)
+        if swath_gdf.empty:
+            raise ValueError(f"No geometry found in {swath_kml_path}.")
+        if swath_gdf.crs is None:
+            swath_gdf = swath_gdf.set_crs("EPSG:4326")
+        swath_geom = unary_union(swath_gdf.geometry.values)
+
+        if mask_gdf.crs is None:
+            mask_gdf = mask_gdf.set_crs("EPSG:4326")
+        elif str(mask_gdf.crs) != "EPSG:4326":
+            mask_gdf = mask_gdf.to_crs("EPSG:4326")
+        mask_geom = unary_union(mask_gdf.geometry.values)
+
+        subset_geom = mask_geom.intersection(swath_geom)
+        if subset_geom.is_empty:
+            raise ValueError(
+                "Coastline mask does not intersect the SWOT swath bbox; "
+                "check coastline_kml_path / buffer_km / swath location."
+            )
+
+        polys = [subset_geom] if subset_geom.geom_type == "Polygon" else [
+            g for g in subset_geom.geoms if g.geom_type == "Polygon" and not g.is_empty
+        ]
+        if not polys:
+            raise ValueError("Coastline/swath intersection produced no polygon area.")
+
+        kml = simplekml.Kml()
+        for i, poly in enumerate(polys):
+            pol = kml.newpolygon(name=f"{name}_{i}" if len(polys) > 1 else name)
+            pol.outerboundaryis = list(poly.exterior.coords)
+            if poly.interiors:
+                pol.innerboundaryis = [list(ring.coords) for ring in poly.interiors]
+            pol.style.linestyle.width = 2
+            pol.style.polystyle.fill = 0
+
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        kml.save(output_path)
+        print(f"Wrote coastal subset polygon ({len(polys)} part(s)) to {output_path}")
+        return output_path
+
+    def make_coastal_subset_kml(
+        self,
+        filepath: str,
+        output_base: str,
+        swath_lon: np.ndarray,
+        swath_lat: np.ndarray,
+        coastline_kml_path: Optional[str] = None,
+        buffer_km: Optional[float] = None,
+    ) -> str:
+        """End-to-end helper for the coastal-subsetting workflow
+        """
+        output_dir = self.make_output_directory(filepath, output_base)
+
+        swath_kml_path = self.export_bbox_kml(
+            swath_lon, swath_lat, filepath, output_base, name="SWOT PIXC Swath"
+        )
+
+        mask_gdf = self.build_coastline_buffer_mask(coastline_kml_path, buffer_km)
+
+        subset_kml_path = os.path.join(output_dir, "coastal_subset.kml")
+        self.subset_kml_to_swath(mask_gdf, swath_kml_path, subset_kml_path)
+
+        return subset_kml_path
 
     def rasterize_category_polygons(self, gdf, output_path: str,
                                      resolution_deg: Optional[float] = None,

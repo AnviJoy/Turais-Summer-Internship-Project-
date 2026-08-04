@@ -10,8 +10,13 @@ import geopandas as gpd
 from Piplineclass import SWOTIntertidalPipeline, SWOTPipelineConfig
 
 
-file = r"C:\Users\pmalesza\Documents\Python Codes\SWOT_L2_HR_PIXC_052_475_245R_20260706T065928_20260706T065939_PID0_01.nc"
-output_base = r"C:\Users\pmalesza\Documents\SWOT_L2_HR_PIXC Output Polygons"
+file = r"C:\Users\Lily Donaldson\Documents\Anvi\Python Codes\SWOT_L2_HR_PIXC_052_475_245R_20260706T065928_20260706T065939_PID0_01.nc"
+
+#r"C:\Users\pmalesza\Documents\Python Codes\SWOT_L2_HR_PIXC_052_475_245R_20260706T065928_20260706T065939_PID0_01.nc"
+
+output_base = r"C:\Users\Lily Donaldson\Documents\Anvi\SWOT_L2_HR_PIXC Output Polygons"
+
+#r"C:\Users\pmalesza\Documents\SWOT_L2_HR_PIXC Output Polygons"
 cycle = 52
 
 
@@ -41,12 +46,19 @@ print("Step 1 - read_pixel_cloud:", pixc_full.shape)
                #value_col="sigma_phase_noise", title="Step 1: Read Pixel Cloud")
 
 
-kml_path = pipe.export_bbox_kml(pixc_full["longitude"], pixc_full["latitude"],
-                                 file, output_base, name="SWOT PIXC Swath")
-print(f"Step 1b - export_bbox_kml: wrote boundary KML to {kml_path}")
+# build a coastal-corridor mask from the UK coastline KML (buffered
+# `coastline_buffer_km` either side, configurable in SWOTPipelineConfig),
+# clip it to this pass's swath extent, and use that as the subset area
+coastal_subset_kml = pipe.make_coastal_subset_kml(
+    file, output_base,
+    pixc_full["longitude"], pixc_full["latitude"],
+    coastline_kml_path=cfg.coastline_kml_path,
+    buffer_km=cfg.coastline_buffer_km,
+)
+print(f"Step 1b - make_coastal_subset_kml: wrote coastal subset KML to {coastal_subset_kml} "
+      f"(buffer = {cfg.coastline_buffer_km} km)")
 
-
-pixc = pipe.subset_by_kml(pixc_full, cfg.subset)
+pixc = pipe.subset_by_kml(pixc_full, coastal_subset_kml)
 print(f"Step 1c - subset_by_kml: {len(pixc)} / {len(pixc_full)} pixels kept")
 #pipe.plot_step(pixc, "step1c_subset_by_kml", output_dir,
                #value_col="sigma_phase_noise", title="Step 1c: Subset by Swath Boundary")
@@ -191,5 +203,3 @@ if "intertidal" in shapefile_paths:
     print(check_gdf[["num_points", "area", "cent_lon", "cent_lat"]])
 
 print("\nDone.")
-
-
