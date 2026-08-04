@@ -129,7 +129,7 @@ class SWOTPipelineConfig:
 
     #subset = r"C:\Users\pmalesza\Documents\SWOT kml\subset.kml"
     
-    subset = r"C:\Users\Lily Donaldson\Documents\Anvi\SWOT kml\SMALL.kml"
+    subset: str = r"C:\Users\Lily Donaldson\Documents\Anvi\SWOT kml\france_subset.kml"
 
     # UK coastline reference line (KML), used to build a coastal buffer mask
     coastline_kml_path: str = r"C:\Users\Lily Donaldson\Documents\Anvi\SWOT kml\UK_coastline_500m_accuracy.kml"
