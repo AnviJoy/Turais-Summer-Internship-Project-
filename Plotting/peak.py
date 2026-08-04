@@ -1,7 +1,7 @@
 import matplotlib.pyplot as plt
 from Piplineclass import SWOTIntertidalPipeline, SWOTPipelineConfig
 
-file = r"C:\Users\Lily Donaldson\Documents\Anvi\Python Codes\SWOT_L2_HR_PIXC_052_475_245R_20260706T065928_20260706T065939_PID0_01.nc"
+file = r"C:\Users\Lily Donaldson\Documents\Anvi\Python Codes\SWOT_L2_HR_PIXC_053_348_073L_20260722T142201_20260722T142213_PID0_01.nc"
 
 #r"C:\Users\pmalesza\Documents\Python Codes\SWOT_L2_HR_PIXC_052_475_245R_20260706T065928_20260706T065939_PID0_01.nc"
 
@@ -17,8 +17,6 @@ output_dir = pipe.make_output_directory(file, output_base)
 
 # replicate the steps in PolygonProcesser.py
 pixc_full = pipe.read_pixel_cloud(file, cycle)
-kml_path = pipe.export_bbox_kml(pixc_full["longitude"], pixc_full["latitude"],
-                                 file, output_base, name="SWOT PIXC Swath")
 pixc = pipe.subset_by_kml(pixc_full, cfg.subset)
 
 ref_lat = float(pixc["latitude"].median())
@@ -55,7 +53,7 @@ plt.scatter(grid[peak_idx], pdf[peak_idx], color="black", zorder=6, s=70,
             marker="*", label="peak_idx used (open water)")
 
 plt.xlabel("Height anomaly h_a (m)")
-plt.xlim(-25,50)
+plt.xlim(-5,10)
 plt.ylabel("Density")
 plt.title(
     f"Step 4 KDE diagnostic — cycle {cycle}\n"
