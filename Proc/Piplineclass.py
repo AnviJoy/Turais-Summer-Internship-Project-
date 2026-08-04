@@ -129,7 +129,7 @@ class SWOTPipelineConfig:
 
     #subset = r"C:\Users\pmalesza\Documents\SWOT kml\subset.kml"
     
-    #subset = r"C:\Users\pmalesza\Documents\SWOT kml\new_small_subset.kml"
+    subset = r"C:\Users\Lily Donaldson\Documents\Anvi\SWOT kml\SMALL.kml"
 
     # UK coastline reference line (KML), used to build a coastal buffer mask
     coastline_kml_path: str = r"C:\Users\Lily Donaldson\Documents\Anvi\SWOT kml\UK_coastline_500m_accuracy.kml"
@@ -1151,11 +1151,6 @@ class SWOTIntertidalPipeline:
     ) -> gpd.GeoDataFrame:
         """Read a coastline KML (one or more lines) and build a polygon mask
         extending `buffer_km` kilometres either side of the coastline.
-
-        The buffer is computed in a projected (metric) CRS so that
-        `buffer_km` is a real distance, then reprojected back to WGS84.
-        Returns a single-row GeoDataFrame (EPSG:4326) holding the
-        (Multi)Polygon mask; also cached on `self._coastline_mask`.
         """
         coastline_kml_path = coastline_kml_path or self.cfg.coastline_kml_path
         buffer_km = buffer_km if buffer_km is not None else self.cfg.coastline_buffer_km
