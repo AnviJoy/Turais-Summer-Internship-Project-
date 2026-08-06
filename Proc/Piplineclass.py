@@ -129,7 +129,7 @@ class SWOTPipelineConfig:
 
     #subset = r"C:\Users\pmalesza\Documents\SWOT kml\subset.kml"
     
-    subset: str = r"C:\Users\Lily Donaldson\Documents\Anvi\SWOT kml\france_subset.kml"
+    subset: str = r"C:\Users\Lily Donaldson\Documents\Anvi\SWOT kml\kirby_subset.kml"
 
     # UK coastline reference line (KML), used to build a coastal buffer mask
     coastline_kml_path: str = r"C:\Users\Lily Donaldson\Documents\Anvi\SWOT kml\UK_coastline_500m_accuracy.kml"
@@ -286,12 +286,35 @@ class SWOTIntertidalPipeline:
         """Return the configured dark-water classification codes (unverified default)."""
         return self.cfg.dark_water_class_codes
 
-    def filter_phase_noise(self, pixc_df: pd.DataFrame,
+    def filter_phase_noise(self, mask, pixc_df: pd.DataFrame,
                             threshold: Optional[float] = None) -> pd.DataFrame:
-        """Drop pixels with sigma_phase_noise above `threshold`."""
+        """Drop pixels with sigma_phase_noise above `threshold`, folding in
+        the keep-mask from the previous pipeline step.
+
+        `mask` is the cumulative mask coming out of the previous step
+        (e.g. `subset_mask` from `subset_by_kml`) — either a plain boolean
+        array positioned like `pixc_df`'s original row order, or a boolean
+        Series sharing `pixc_df`'s index. The returned mask is the same
+        length/index as `mask` (i.e. still full-length relative to the
+        original pixel cloud), with this step's condition folded in, so it
+        can be passed straight into the next filtering step.
+        """
         threshold = threshold if threshold is not None \
             else self.cfg.sigma_phase_noise_threshold
-        return pixc_df[pixc_df["sigma_phase_noise"] <= threshold].reset_index(drop=True)
+
+        mask_series = mask if isinstance(mask, pd.Series) \
+            else pd.Series(np.asarray(mask), index=range(len(mask)))
+
+        own_cond = pixc_df["sigma_phase_noise"] <= threshold
+        combined = mask_series.loc[pixc_df.index] & own_cond
+
+        phase_noise_mask = mask_series.copy()
+        phase_noise_mask.loc[pixc_df.index] = combined
+
+        # index preserved (not reset) so `phase_noise_mask` stays aligned
+        # with `thres` for the next step in the chain.
+        thres = pixc_df[combined]
+        return thres, phase_noise_mask
 
     def estimate_phase_noise_threshold(self, pixc_df: pd.DataFrame) -> float:
         """Return the median sigma_phase_noise as a starting threshold estimate."""
@@ -419,11 +442,10 @@ class SWOTIntertidalPipeline:
 
         return float(h_a_lower)
 
-    def filter_open_water(self, pixc_df: pd.DataFrame) -> pd.DataFrame:
+    def filter_open_water(self, pixc_df: pd.DataFrame, phase_noise_mask) -> pd.DataFrame: 
         """Return candidate non-open-water pixels (h_a within the Step 4 cutoffs)."""
         h_a = pixc_df["h_a"].to_numpy()
         grid, pdf, _ = self._kde_pdf(h_a)
-        
 
         peaks_idx = self.find_pdf_peaks(grid, pdf)
         if peaks_idx.size == 0:
@@ -434,21 +456,45 @@ class SWOTIntertidalPipeline:
         h_a_upper = self.compute_upper_cutoff(grid, pdf, peak_idx)
         h_a_lower = self.compute_lower_cutoff(grid, pdf, peak_idx, h_a_upper)
 
-        candidates = pixc_df[(pixc_df["h_a"] >= h_a_lower) &
-                              (pixc_df["h_a"] <= h_a_upper)].reset_index(drop=True)
+        own_cond = (pixc_df["h_a"] >= h_a_lower) & (pixc_df["h_a"] <= h_a_upper)
+
+        # `phase_noise_mask` may be full-length (indexed like the original
+        # pixel cloud) while `pixc_df` here is already restricted to the
+        # phase-noise-kept rows — reindex/align by label rather than by
+        # raw `&`, which would otherwise silently misalign the two Series.
+        mask_series = phase_noise_mask if isinstance(phase_noise_mask, pd.Series) \
+            else pd.Series(np.asarray(phase_noise_mask), index=range(len(phase_noise_mask)))
+
+        combined = mask_series.loc[pixc_df.index] & own_cond
+
+        open_water_mask = mask_series.copy()
+        open_water_mask.loc[pixc_df.index] = combined
+
+        candidates = pixc_df[combined]
+
         candidates.attrs.update({
             "grid": grid, "pdf": pdf, "peak_idx": peak_idx,
             "h_a_lower": h_a_lower, "h_a_upper": h_a_upper,
         })
-        return candidates
+        return candidates, open_water_mask
 
-    def build_water_extent_mask(self, per_cycle_filtered_pixc: Sequence[pd.DataFrame],
+    def build_water_extent_mask(self, open_water_mask, per_cycle_filtered_pixc: Sequence[pd.DataFrame],
                                  grid_res_deg: Optional[float] = None,
                                  validity_quantile: Optional[float] = None):
         """Build and cache the region's water extent polygon from per-cycle pixel validity."""
         grid_res_deg = grid_res_deg or self.cfg.mask_grid_res_deg
         validity_quantile = validity_quantile if validity_quantile is not None \
             else self.cfg.mask_validity_quantile
+
+        # Fold in the mask from the previous step: only pixels flagged True
+        # in `open_water_mask` count toward the validity grid used to build
+        # the extent polygon.
+        mask_series = open_water_mask if isinstance(open_water_mask, pd.Series) \
+            else pd.Series(np.asarray(open_water_mask), index=range(len(open_water_mask)))
+        per_cycle_filtered_pixc = [
+            df[mask_series.reindex(df.index, fill_value=False)]
+            for df in per_cycle_filtered_pixc
+        ]
 
         all_lat = np.concatenate([df["latitude"].to_numpy() for df in per_cycle_filtered_pixc])
         all_lon = np.concatenate([df["longitude"].to_numpy() for df in per_cycle_filtered_pixc])
@@ -513,6 +559,207 @@ class SWOTIntertidalPipeline:
         cleaned = self._clean_polygon(largest)
         self._water_extent_mask = cleaned
         return cleaned
+    
+    def polygons_from_binary_mask(
+        self,
+        binary_mask,
+        lon_grid,
+        lat_grid,
+        category="intertidal",
+    ):
+        """Convert a binary mask into a GeoDataFrame of polygons."""
+
+        labelled_array, num_features = label(binary_mask, structure=np.ones((3, 3)))
+
+        records = []
+
+        for region_id in range(1, num_features + 1):
+            region_mask = labelled_array == region_id
+
+            xs = lon_grid[region_mask]
+            ys = lat_grid[region_mask]
+
+            valid = ~np.isnan(xs) & ~np.isnan(ys)
+            xs = xs[valid]
+            ys = ys[valid]
+
+            if len(xs) < self.cfg.min_region_points:
+                continue
+
+            polygon = MultiPoint(list(zip(xs, ys))).convex_hull
+
+            if polygon.is_empty:
+                continue
+
+            centroid = polygon.centroid
+
+            records.append({
+                "category": category,
+                "region_id": region_id,
+                "num_points": len(xs),
+                "area": polygon.area,
+                "cent_lon": centroid.x,
+                "cent_lat": centroid.y,
+                "geometry": polygon,
+            })
+
+        if len(records) == 0:
+            return gpd.GeoDataFrame(
+                columns=[
+                    "category",
+                    "region_id",
+                    "num_points",
+                    "area",
+                    "cent_lon",
+                    "cent_lat",
+                    "geometry",
+                ],
+                geometry="geometry",
+                crs="EPSG:4326",
+            )
+
+        return gpd.GeoDataFrame(records, geometry="geometry", crs="EPSG:4326")
+
+    def polygons_from_raster_mask(
+        self,
+        binary_mask,
+        lon_grid,
+        lat_grid,
+        category="intertidal",
+        fill_holes=True,
+    ):
+        """Vectorise a binary az/range mask into polygons that trace each
+        region's actual pixel boundary, instead of convex-hulling its
+        points like `polygons_from_binary_mask` does.
+
+        `fill_holes`: if True (default), fully-enclosed background gaps
+        inside a region (a stray dropped pixel, a KDE cutoff excluding one
+        cell, etc.) are filled in before tracing, so the resulting polygon
+        has no interior holes. Set False if small enclosed features (real
+        islets/rocks within a water body) should be preserved as holes.
+        """
+        mask_bool = np.asarray(binary_mask, dtype=bool)
+        if fill_holes:
+            mask_bool = binary_fill_holes(mask_bool, structure=np.ones((3, 3)))
+
+        labelled_array, num_features = label(
+            mask_bool, structure=np.ones((3, 3))
+        )
+
+        records = []
+        for region_id in range(1, num_features + 1):
+            region_mask = labelled_array == region_id
+            num_points = int(region_mask.sum())
+            if num_points < self.cfg.min_region_points:
+                continue
+
+            region_u8 = region_mask.astype(np.uint8)
+            pixel_polys = [
+                _shapely_shape(geom)
+                for geom, val in _rio_shapes(region_u8, mask=region_mask, connectivity=8)
+                if val == 1
+            ]
+            if not pixel_polys:
+                continue
+            pixel_polygon = pixel_polys[0] if len(pixel_polys) == 1 else unary_union(pixel_polys)
+
+            lonlat_polygon = self._pixel_polygon_to_lonlat(pixel_polygon, lon_grid, lat_grid)
+            if lonlat_polygon is None or lonlat_polygon.is_empty:
+                continue
+
+            centroid = lonlat_polygon.centroid
+            records.append({
+                "category": category,
+                "region_id": region_id,
+                "num_points": num_points,
+                "area": lonlat_polygon.area,
+                "cent_lon": centroid.x,
+                "cent_lat": centroid.y,
+                "geometry": lonlat_polygon,
+            })
+
+        if len(records) == 0:
+            return gpd.GeoDataFrame(
+                columns=[
+                    "category", "region_id", "num_points",
+                    "area", "cent_lon", "cent_lat", "geometry",
+                ],
+                geometry="geometry",
+                crs="EPSG:4326",
+            )
+
+        return gpd.GeoDataFrame(records, geometry="geometry", crs="EPSG:4326")
+
+    def _pixel_polygon_to_lonlat(self, pixel_polygon, lon_grid, lat_grid):
+        """Remap a Polygon/MultiPolygon whose coordinates are (col, row)
+        pixel-space vertices (as produced by `rasterio.features.shapes`
+        with the default identity transform) into lon/lat space, using
+        `lon_grid`/`lat_grid` to look up each vertex's real-world position.
+        """
+        def convert_ring(coords):
+            return [self._pixel_corner_to_lonlat(x, y, lon_grid, lat_grid) for x, y in coords]
+
+        polys = [pixel_polygon] if pixel_polygon.geom_type == "Polygon" else list(pixel_polygon.geoms)
+
+        out_polys = []
+        for poly in polys:
+            exterior = convert_ring(poly.exterior.coords)
+            if any(p is None for p in exterior):
+                # a corner fell entirely outside the populated swath grid;
+                # drop this piece rather than build a polygon with a gap
+                continue
+
+            interiors, skip = [], False
+            for ring in poly.interiors:
+                conv = convert_ring(ring.coords)
+                if any(p is None for p in conv):
+                    skip = True
+                    break
+                interiors.append(conv)
+            if skip:
+                continue
+
+            new_poly = Polygon(exterior, interiors)
+            if not new_poly.is_valid:
+                new_poly = new_poly.buffer(0)
+                if isinstance(new_poly, MultiPolygon):
+                    new_poly = max(new_poly.geoms, key=lambda p: p.area)
+            if not new_poly.is_empty:
+                out_polys.append(new_poly)
+
+        if not out_polys:
+            return None
+        if len(out_polys) == 1:
+            return out_polys[0]
+
+        merged = unary_union(out_polys)
+        if isinstance(merged, MultiPolygon):
+            merged = max(merged.geoms, key=lambda p: p.area)
+        return merged
+
+    def _pixel_corner_to_lonlat(self, x, y, lon_grid, lat_grid):
+        """Average the lon/lat of the (up to 4) grid cells touching
+        pixel-space corner (x, y) = (col, row), skipping any that fall
+        outside the populated swath (NaN in `lon_grid`/`lat_grid`).
+        Returns None only if none of the touching cells are populated.
+        """
+        n_rows, n_cols = lon_grid.shape
+        rows = sorted({int(np.floor(y)), int(np.ceil(y))})
+        cols = sorted({int(np.floor(x)), int(np.ceil(x))})
+
+        lons, lats = [], []
+        for r in rows:
+            for c in cols:
+                rc = int(np.clip(r, 0, n_rows - 1))
+                cc = int(np.clip(c, 0, n_cols - 1))
+                lon_val, lat_val = lon_grid[rc, cc], lat_grid[rc, cc]
+                if np.isfinite(lon_val) and np.isfinite(lat_val):
+                    lons.append(lon_val)
+                    lats.append(lat_val)
+
+        if not lons:
+            return None
+        return (float(np.mean(lons)), float(np.mean(lats)))
 
     def _clean_polygon(self, polygon):
         """Drop small holes and lightly smooth a polygon's boundary."""
@@ -565,8 +812,15 @@ class SWOTIntertidalPipeline:
         return cleaned
 
     def apply_water_extent_mask(self, candidates_df: pd.DataFrame,
-                                 mask_polygon=None) -> pd.DataFrame:
-        """Keep only candidate pixels that fall inside the water extent mask."""
+                                 mask_polygon=None, base_mask=None) -> pd.DataFrame:
+        """Keep only candidate pixels that fall inside the water extent mask.
+
+        If `base_mask` (the cumulative mask from the previous step, e.g.
+        `open_water_mask`) is given, the returned mask is expanded to that
+        same full length/index instead of being positional-only relative
+        to `candidates_df`, so it stays consistent with the rest of the
+        chain and can be plotted the same way as the earlier step masks.
+        """
         mask_polygon = mask_polygon or self._water_extent_mask
         if mask_polygon is None:
             raise ValueError("No water_extent_mask provided or cached; "
@@ -587,7 +841,14 @@ class SWOTIntertidalPipeline:
         inside = vectorized.contains(mask_polygon, df["longitude"].to_numpy(),
                                       df["latitude"].to_numpy())
 
-        return df[inside].reset_index(drop=True)
+        if base_mask is not None:
+            base_series = base_mask if isinstance(base_mask, pd.Series) \
+                else pd.Series(np.asarray(base_mask), index=range(len(base_mask)))
+            inside_series = pd.Series(False, index=base_series.index)
+            inside_series.loc[df.index] = inside
+            return df[inside].reset_index(drop=True), inside_series
+
+        return df[inside].reset_index(drop=True), inside
 
     def cluster_points_to_polygons(self, df: pd.DataFrame, category: str,
                                     grid_res_deg: Optional[float] = None,
@@ -696,7 +957,10 @@ class SWOTIntertidalPipeline:
             warnings.warn("No reference pixel recorded on this DataFrame.")
             return False
         lat, lon = ref_latlon
-        row = pixc_df.iloc[
+        # .loc, not .iloc: idxmin() returns an index *label*, and pixc_df's
+        # index is no longer guaranteed to be a plain 0..N-1 range now that
+        # earlier steps preserve original row labels for mask alignment.
+        row = pixc_df.loc[
             ((pixc_df["latitude"] - lat).abs() +
              (pixc_df["longitude"] - lon).abs()).idxmin()
         ]
@@ -712,8 +976,10 @@ class SWOTIntertidalPipeline:
         enabled = self.cfg.exclude_dark_water if enabled is None else enabled
         if not enabled:
             return pixc_df
+        # index preserved (not reset) so any mask computed against pixc_df
+        # before/after this call stays aligned to the same row labels.
         return pixc_df[~pixc_df["classification"].isin(
-            self._dark_water_class_codes())].reset_index(drop=True)
+            self._dark_water_class_codes())]
 
     def remove_regional_gradient(self, pixc_df: pd.DataFrame,
                                   gradient_model=None) -> pd.DataFrame:
@@ -965,6 +1231,42 @@ class SWOTIntertidalPipeline:
             "lat_grid": lat_grid,
         }
 
+    def gridify(self, az, rg, values, grids=None, fill_value=0, dtype=None) -> np.ndarray:
+        """Scatter any per-pixel array — a boolean mask, h_a, sigma_phase_noise,
+        whatever — into an azimuth/range grid.
+        """
+        az = np.asarray(az).astype(int)
+        rg = np.asarray(rg).astype(int)
+        values = values.to_numpy() if isinstance(values, pd.Series) else np.asarray(values)
+
+        if not (len(az) == len(rg) == len(values)):
+            raise ValueError(
+                f"gridify: az ({len(az)}), rg ({len(rg)}), and values "
+                f"({len(values)}) must be the same length and share row order."
+            )
+
+        if grids is not None:
+            az_min, rg_min = grids["az_min"], grids["rg_min"]
+            n_az, n_rg = grids["populated"].shape
+        else:
+            az_min, rg_min = int(az.min()), int(rg.min())
+            n_az = int(az.max()) - az_min + 1
+            n_rg = int(rg.max()) - rg_min + 1
+
+        row = az - az_min
+        col = rg - rg_min
+        in_bounds = (row >= 0) & (row < n_az) & (col >= 0) & (col < n_rg)
+        if not in_bounds.all():
+            warnings.warn(
+                f"gridify: {int((~in_bounds).sum())} pixel(s) fell outside "
+                "the target grid and were dropped."
+            )
+
+        dtype = dtype if dtype is not None else values.dtype
+        grid = np.full((n_az, n_rg), fill_value, dtype=dtype)
+        grid[row[in_bounds], col[in_bounds]] = values[in_bounds]
+        return grid
+
     def scatter_indices_to_grid(self, az: np.ndarray, rg: np.ndarray, grids: dict) -> np.ndarray:
         """Return a boolean grid (same shape as `grids`) marking every
         (az, rg) pixel-index pair present in the given arrays."""
@@ -1139,9 +1441,13 @@ class SWOTIntertidalPipeline:
 
         mask = vectorized.contains(poly, lon, lat) | vectorized.touches(poly, lon, lat)
 
-        subset = pixc_df[mask].reset_index(drop=True)
+        # NOTE: index is intentionally NOT reset here. Keeping the original
+        # pixc_df row labels lets `mask` (and every mask derived from it in
+        # later steps) stay aligned to the same reference frame, so masks
+        # can be chained together with straightforward boolean indexing.
+        subset = pixc_df[mask]
         print(f"Kept {int(mask.sum())}/{len(pixc_df)} points inside {kml_path}")
-        return subset
+        return subset, mask
 
     def build_coastline_buffer_mask(
         self,
@@ -1426,6 +1732,61 @@ class SWOTIntertidalPipeline:
                          transform=ax.transAxes)
 
             ax.set_title(plot_title)
+            plt.tight_layout()
+
+            path = os.path.join(output_dir, f"{step_name}.png")
+            fig.savefig(path, dpi=dpi)
+            print(f"Saved step plot: {path}")
+
+            if show:
+                plt.show()
+            return path
+        finally:
+            plt.close(fig)
+
+    def plot_mask_step(self, base_df: pd.DataFrame, mask, step_name: str,
+                        output_dir: str, *, title: Optional[str] = None,
+                        dpi: int = 150, show: bool = False):
+        """Scatter-plot a boolean pixel mask (kept vs. dropped) over the
+        lon/lat of `base_df`.
+
+        `plot_step` doesn't have a branch for a raw boolean array/Series,
+        so a mask handed to it (subset_mask, phase_noise_mask,
+        open_water_mask, ...) either gets silently histogrammed or falls
+        through to "No data to plot". This method is the one to use for
+        those masks instead: it aligns `mask` to `base_df`'s rows (by
+        label if `mask` is a Series, otherwise by position) and colors
+        each point by whether it was kept.
+        """
+        mask_arr = mask.to_numpy() if isinstance(mask, pd.Series) else np.asarray(mask)
+
+        if isinstance(mask, pd.Series):
+            mask_arr = mask.reindex(base_df.index, fill_value=False).to_numpy()
+        elif len(mask_arr) != len(base_df):
+            raise ValueError(
+                f"plot_mask_step: mask length ({len(mask_arr)}) does not match "
+                f"base_df length ({len(base_df)}); pass mask as a pandas Series "
+                "sharing base_df's index if lengths legitimately differ."
+            )
+
+        lon = base_df["longitude"].to_numpy()
+        lat = base_df["latitude"].to_numpy()
+
+        fig, ax = plt.subplots(figsize=(8, 8))
+        try:
+            colors = np.where(mask_arr, "darkorange", "lightgray")
+            ax.scatter(lon, lat, c=colors, s=2)
+            ax.set_xlabel("Longitude")
+            ax.set_ylabel("Latitude")
+
+            mean_lat = np.deg2rad(np.nanmean(lat)) if lat.size else 0.0
+            aspect = 1 / np.cos(mean_lat)
+            if np.isfinite(aspect) and aspect > 0:
+                ax.set_aspect(aspect)
+
+            n_kept = int(np.sum(mask_arr))
+            plot_title = title or step_name.replace("_", " ").title()
+            ax.set_title(f"{plot_title}\n({n_kept}/{len(mask_arr)} kept)")
             plt.tight_layout()
 
             path = os.path.join(output_dir, f"{step_name}.png")
