@@ -10,7 +10,7 @@ import geopandas as gpd
 from Piplineclass import SWOTIntertidalPipeline, SWOTPipelineConfig
 
 
-file = r"C:\Users\Lily Donaldson\Documents\Anvi\Python Codes\SWOT_L2_HR_PIXC_053_348_073L_20260722T142201_20260722T142213_PID0_01.nc"
+file = r"C:\Users\Lily Donaldson\Documents\Anvi\Python Codes\SWOT_L2_HR_PIXC_501_016_060L_20230425T064527_20230425T064532_PGC0_01.nc"
 
 #r"C:\Users\pmalesza\Documents\Python Codes\SWOT_L2_HR_PIXC_052_475_245R_20260706T065928_20260706T065939_PID0_01.nc"
 
@@ -21,6 +21,7 @@ cycle = 52
 
 
 SHOW_PLOTS = False
+build_plots = True
 concave_hull_ratio = 0.1  # 0 = tightest hull, 1 = convex hull
 
 
@@ -47,10 +48,13 @@ print("Step 1 - read_pixel_cloud:", pixc_full.shape)
 
 
 # subset straight to the France KML polygon defined in cfg.subset
-pixc = pipe.subset_by_kml(pixc_full, cfg.subset)
+pixc, subset_mask = pipe.subset_by_kml(pixc_full, cfg.subset)
 print(f"Step 1b - subset_by_kml (france_subset): {len(pixc)} / {len(pixc_full)} pixels kept")
-#pipe.plot_step(pixc, "step1b_subset_by_kml", output_dir,
-               #value_col="sigma_phase_noise", title="Step 1b: Subset by France KML")
+print(type(subset_mask))
+if build_plots:
+    
+   pipe.plot_mask_step(pixc_full, subset_mask, "step1b_subset_by_kml", output_dir,
+                     title="Step 1b: Subset by France KML")
 
 #print(pipe.estimate_phase_noise_threshold(pixc))  
 
@@ -78,110 +82,164 @@ pixc = pipe.filter_dark_water(pixc)
 
 
 # phase noise filter
-filtered = pipe.filter_phase_noise(pixc)
+filtered, phase_noise_mask = pipe.filter_phase_noise(subset_mask, pixc)
 print(f"Step 3 - filter_phase_noise: {len(filtered)} / {len(pixc)} pixels kept")
-#pipe.plot_step(filtered, "step3_filter_phase_noise", output_dir,
-               #value_col="h_a", title="Step 3: Phase-Noise Filtered Pixels")
+if build_plots:
+   pipe.plot_mask_step(pixc_full, phase_noise_mask, "step3_filter_phase_noise", output_dir,
+                     title="Step 3: Phase-Noise Filtered Pixels")
 
 
 # PDF-based open water filter to candidate intertidal+land pixels
 
 _t = _step_timer()
-candidates = pipe.filter_open_water(filtered)
+candidates, open_water_mask = pipe.filter_open_water(filtered, phase_noise_mask)
 print(f"Step 4 - filter_open_water: {len(candidates)} candidate pixels "
       f"(h_a_lower={candidates.attrs['h_a_lower']:.4f},"
       f"h_a_upper={candidates.attrs['h_a_upper']:.4f})")
 _t("filter_open_water / KDE")
-#pipe.plot_step(candidates, "step4_filter_open_water", output_dir,
-               #value_col="h_a", title="Step 4: Open-Water Filtered Candidates")
+if build_plots:
+   pipe.plot_mask_step(pixc_full, open_water_mask, "step4_filter_open_water", output_dir,
+                     title="Step 4: Open-Water Filtered Candidates")
 
 
 # water extent mask, applied to the candidates, pixels that are the actual fully filtered intertidal set for this cycle
-
 _t = _step_timer()
-water_extent_mask = pipe.build_water_extent_mask([filtered])
+water_extent_mask = pipe.build_water_extent_mask(open_water_mask, [filtered])
 print(f"Step 5a - build_water_extent_mask: polygon area="
       f"{water_extent_mask.area:.8f} deg^2, bounds={water_extent_mask.bounds}")
 _t("build_water_extent_mask")
-#pipe.plot_step(water_extent_mask, "step5a_water_extent_mask", output_dir,
-              # title="Step 5a: Water Extent Mask")
+if build_plots:
+  pipe.plot_step(water_extent_mask, "step5a_water_extent_mask", output_dir,
+              title="Step 5a: Water Extent Mask")
 
 _t = _step_timer()
 print(f"    water_extent_mask.is_valid = {water_extent_mask.is_valid}, "
       f"n_exterior_coords = {len(water_extent_mask.exterior.coords)}")
-intertidal_pixels = pipe.apply_water_extent_mask(candidates, water_extent_mask)
+#intertidal_pixels = pipe.apply_water_extent_mask(candidates, water_extent_mask)
+intertidal_pixels, inside_mask = pipe.apply_water_extent_mask(
+    candidates,
+    water_extent_mask,
+    base_mask=open_water_mask,
+)
 _t("apply_water_extent_mask")
 print(f"Step 5b - apply_water_extent_mask: {len(intertidal_pixels)} final "
       f"intertidal pixels")
 _t = _step_timer()
-#pipe.plot_step(intertidal_pixels, "step5b_apply_water_extent_mask", output_dir,
-               #value_col="h_a", title="Step 5b: Final Intertidal Pixels")
-_t("plot_step (step5b)")
+if build_plots:
+  pipe.plot_step(intertidal_pixels, "step5b_apply_water_extent_mask", output_dir,
+               value_col="h_a", title="Step 5b: Final Intertidal Pixels")
+  _t("plot_step (step5b)")
 
 
 _t = _step_timer()
 intertidal_pixels = pipe.estimate_pixel_uncertainty(intertidal_pixels)
 _t("estimate_pixel_uncertainty")
 
-
-# polygons
-
-h_a_lower = candidates.attrs["h_a_lower"]
-water_pixels = filtered[filtered["h_a"] < h_a_lower].reset_index(drop=True)
-
-# Cluster points into spatially connected groups first 
 _t = _step_timer()
-water_gdf = pipe.cluster_points_to_polygons(
-    water_pixels, "water", concave_hull_ratio=concave_hull_ratio
-)
-_t("cluster_points_to_polygons (water)")
-print(f"Water polygons: {len(water_gdf)}")
+grid = pipe.gridify(pixc_full["azimuth_index"], pixc_full["range_index"], inside_mask)
+_t("gridify")
+if build_plots:
+    pipe.plot_step(grid, "step5c_intertidal_grid", output_dir,
+                    title="Step 5c: Final Intertidal Mask (az/range grid)")
+
+
+# polygons 
 
 _t = _step_timer()
-intertidal_gdf = pipe.cluster_points_to_polygons(
-    intertidal_pixels, "intertidal", concave_hull_ratio=concave_hull_ratio
+lon_grid = pipe.gridify(
+    pixc_full["azimuth_index"], pixc_full["range_index"],
+    pixc_full["longitude"], fill_value=np.nan, dtype=float,
 )
-_t("cluster_points_to_polygons (intertidal)")
-print(f"Intertidal polygons (from filtered pixels only): {len(intertidal_gdf)}")
+lat_grid = pipe.gridify(
+    pixc_full["azimuth_index"], pixc_full["range_index"],
+    pixc_full["latitude"], fill_value=np.nan, dtype=float,
+)
+_t("gridify (lon/lat)")
+
+_t = _step_timer()
+
+# # Cluster points into spatially connected groups first 
+# _t = _step_timer()
+# water_gdf = pipe.cluster_points_to_polygons(
+#      water_pixels, "water", concave_hull_ratio=concave_hull_ratio
+# )
+# _t("cluster_points_to_polygons (water)")
+# print(f"Water polygons: {len(water_gdf)}")
+
+#_t = _step_timer()
+# intertidal_gdf = pipe.cluster_points_to_polygons(
+#     intertidal_pixels, "intertidal", concave_hull_ratio=concave_hull_ratio
+# )
+# _t("cluster_points_to_polygons (intertidal)")
+# print(f"Intertidal polygons (from filtered pixels only): {len(intertidal_gdf)}")
+
+# old method 
+
+# arrays = pipe.read_pixel_cloud_arrays(file)
+
+# grids = pipe.build_land_water_intertidal_grids(arrays)
+
+# grids = pipe.scatter_indices_to_grid(arrays)
+
+# keep_mask = pipe.scatter_indices_to_grid(
+#     intertidal_pixels["azimuth_index"],
+#     intertidal_pixels["range_index"],
+    #grids,
+#)
+
+#restricted = pipe.restrict_grids_to_mask(
+    #grids,
+   # keep_mask,
+#)
+
+#binary_mask = restricted["final_mask"]
+
+#intertidal_gdf = pipe.polygons_from_binary_mask(
+    #binary_mask,
+    #restricted["lon_grid"],
+    #restricted["lat_grid"],
+    #category="intertidal",
+#)
 
 
-# export shapefiles + KMLs for each category that has polygons
+# new method
+intertidal_gdf = pipe.polygons_from_raster_mask(
+    grid, lon_grid, lat_grid, category="intertidal", fill_holes=True,
+)
+_t("polygons_from_raster_mask")
+print(f"Step 6 - polygons_from_raster_mask: {len(intertidal_gdf)} intertidal polygon(s)")
+
+# export shapefile + KML for the intertidal category, if any polygons were found
 
 shapefile_paths = {}
-for category, category_gdf in (("water", water_gdf), ("intertidal", intertidal_gdf)):
-    if category_gdf is None or len(category_gdf) == 0:
-        print(f"No {category} pixels found.")
-        continue
-    shapefile_paths[category] = pipe.export_polygons_shapefile(category_gdf, category, output_dir)
-    pipe.export_polygons_kml(category_gdf, category, output_dir)
-
+if len(intertidal_gdf) == 0:
+    print("No intertidal polygons found.")
+else:
+    shapefile_paths["intertidal"] = pipe.export_polygons_shapefile(intertidal_gdf, "intertidal", output_dir)
+    pipe.export_polygons_kml(intertidal_gdf, "intertidal", output_dir)
 
 # optional aggregate grid for parity
 
 _t = _step_timer()
-grid = pipe.aggregate_to_grid(intertidal_pixels)
+agg_grid = pipe.aggregate_to_grid(intertidal_pixels)
 grid_csv = os.path.join(output_dir, "intertidal_grid.csv")
-grid.to_csv(grid_csv, index=False)
+agg_grid.to_csv(grid_csv, index=False)
 print(f"Wrote gridded output to {grid_csv}")
-_t(f"aggregate_to_grid ({len(grid)} cells x "
-   f"{cfg.mc_realizations} MC realizations)")
-
+_t(f"aggregate_to_grid ({len(agg_grid)} cells x {cfg.mc_realizations} MC realizations)")
 
 # plots
 
-_t = _step_timer()
-ax1 = pipe.plot_category_polygons({
-    "water": water_gdf,
-    "intertidal": intertidal_gdf,
-})
-polygons_png = os.path.join(output_dir, "category_polygons.png")
-ax1.figure.savefig(polygons_png, dpi=150)
-print(f"Saved category polygons plot to {polygons_png}")
-if SHOW_PLOTS:
-    plt.show()
-else:
-    plt.close(ax1.figure)
-_t("plotting")
+if len(intertidal_gdf) > 0:
+    _t = _step_timer()
+    ax1 = pipe.plot_category_polygons({"intertidal": intertidal_gdf})
+    polygons_png = os.path.join(output_dir, "category_polygons.png")
+    ax1.figure.savefig(polygons_png, dpi=150)
+    print(f"Saved category polygons plot to {polygons_png}")
+    if SHOW_PLOTS:
+        plt.show()
+    else:
+        plt.close(ax1.figure)
+    _t("plotting")
 
 if "intertidal" in shapefile_paths:
     check_gdf = gpd.read_file(shapefile_paths["intertidal"])
