@@ -548,17 +548,26 @@ class SWOTIntertidalPipeline:
                 merged = unary_union(polygons.values)
         else:
             merged = unary_union(polygons.values)
-        #merged = merged.buffer(grid_res_deg).buffer(-grid_res_deg)
-        merged = merged 
-        
+
+        # Clean the merged geometry but keep all disconnected polygons
         if isinstance(merged, MultiPolygon):
-            largest = max(merged.geoms, key=lambda p: p.area)
+            cleaned = MultiPolygon(
+                [self._clean_polygon(poly) for poly in merged.geoms]
+            )
         else:
-            largest = merged
-        
-        cleaned = self._clean_polygon(largest)
+            cleaned = self._clean_polygon(merged)
+
         self._water_extent_mask = cleaned
         return cleaned
+        
+        # if isinstance(merged, MultiPolygon):
+        #     largest = max(merged.geoms, key=lambda p: p.area)
+        # else:
+        #     largest = merged
+        
+        # cleaned = self._clean_polygon(largest)
+        # self._water_extent_mask = cleaned
+        # return cleaned
     
     def polygons_from_binary_mask(
         self,
@@ -1335,6 +1344,46 @@ class SWOTIntertidalPipeline:
             })
 
         return gpd.GeoDataFrame(records, crs="EPSG:4326")
+
+
+    def remove_small_polygons(self, geometry, min_area, area_col: Optional[str] = None):
+       """
+       Remove polygons smaller than min_area.
+
+       Accepts a single Polygon, a MultiPolygon, or a GeoDataFrame of
+       polygons:
+         - Polygon: returns the polygon unchanged, or an empty Polygon()
+           if its area is below min_area.
+         - MultiPolygon: returns a MultiPolygon containing only the
+           member polygons at or above min_area (Polygon()/single Polygon
+           if 0 or 1 remain).
+         - GeoDataFrame: returns a copy with rows below min_area dropped.
+           If `area_col` is given and present, that column is used
+           directly instead of recomputing `geometry.area` per row.
+       """
+       if isinstance(geometry, gpd.GeoDataFrame):
+           if len(geometry) == 0:
+               return geometry
+           if area_col is not None and area_col in geometry.columns:
+               areas = geometry[area_col]
+           else:
+               areas = geometry.geometry.area
+           return geometry[areas >= min_area].reset_index(drop=True)
+
+       if isinstance(geometry, Polygon):
+          return geometry if geometry.area >= min_area else Polygon()
+
+       elif isinstance(geometry, MultiPolygon):
+           kept = [poly for poly in geometry.geoms if poly.area >= min_area]
+
+           if len(kept) == 0:
+               return Polygon()
+           elif len(kept) == 1:
+               return kept[0]
+           else:
+               return MultiPolygon(kept)
+
+       return geometry
 
     def export_polygons_shapefile(self, gdf, category: str, output_dir: str) -> str:
         """Write a polygon GeoDataFrame to `<output_dir>/<category>_polygon.shp`."""
