@@ -23,10 +23,6 @@ cycle = 52
 
 SHOW_PLOTS = False
 build_plots = False
-concave_hull_ratio = 0.1  # 0 = tightest hull, 1 = convex hull
-
-# minimum area (deg^2) for a final intertidal polygon to be kept
-min_intertidal_polygon_area = 7.7e-5
 
 
 def _step_timer():
@@ -124,11 +120,10 @@ print(
 # Remove very small polygons. Threshold is set relative to the largest
 # piece (rather than a fixed absolute number) so it scales correctly
 # regardless of the mask's actual area units - drops pieces under
-# water_extent_min_piece_fraction of the largest connected region.
-water_extent_min_piece_fraction = 0.001  # 0.1% of the largest piece
-water_extent_min_area = max(piece_areas) * water_extent_min_piece_fraction
+# cfg.water_extent_min_piece_fraction of the largest connected region.
+water_extent_min_area = max(piece_areas) * cfg.water_extent_min_piece_fraction
 print(f"    remove_small_polygons: using min_area={water_extent_min_area:.3e} deg^2 "
-      f"({water_extent_min_piece_fraction:.1%} of largest piece)")
+      f"({cfg.water_extent_min_piece_fraction:.1%} of largest piece)")
 
 water_extent_mask = pipe.remove_small_polygons(
     water_extent_mask,
@@ -220,13 +215,13 @@ if len(intertidal_gdf) > 0:
         f"max={intertidal_gdf['area'].max():.3e}"
     )
 
-# drop final intertidal polygons smaller than min_intertidal_polygon_area
+# drop final intertidal polygons smaller than cfg.min_intertidal_polygon_area
 n_before = len(intertidal_gdf)
 intertidal_gdf = pipe.remove_small_polygons(
-    intertidal_gdf, min_area=min_intertidal_polygon_area, area_col="area",
+    intertidal_gdf, min_area=cfg.min_intertidal_polygon_area, area_col="area",
 )
 print(f"Step 6b - remove_small_polygons: kept {len(intertidal_gdf)} / {n_before} "
-      f"intertidal polygon(s) (min_area={min_intertidal_polygon_area} deg^2)")
+      f"intertidal polygon(s) (min_area={cfg.min_intertidal_polygon_area} deg^2)")
 
 # export shapefile + KML for the intertidal category, if any polygons were found
 
