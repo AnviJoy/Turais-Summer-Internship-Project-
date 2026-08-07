@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 import shapely
 from shapely.geometry import MultiPoint
 import geopandas as gpd
+from shapely.geometry import MultiPolygon
 
 from Piplineclass import SWOTIntertidalPipeline, SWOTPipelineConfig
 
@@ -21,8 +22,11 @@ cycle = 52
 
 
 SHOW_PLOTS = False
-build_plots = True
+build_plots = False
 concave_hull_ratio = 0.1  # 0 = tightest hull, 1 = convex hull
+
+# minimum area (deg^2) for a final intertidal polygon to be kept
+min_intertidal_polygon_area = 7.7e-5
 
 
 def _step_timer():
@@ -105,6 +109,32 @@ if build_plots:
 # water extent mask, applied to the candidates, pixels that are the actual fully filtered intertidal set for this cycle
 _t = _step_timer()
 water_extent_mask = pipe.build_water_extent_mask(open_water_mask, [filtered])
+
+if water_extent_mask.geom_type == "MultiPolygon":
+    piece_areas = [poly.area for poly in water_extent_mask.geoms]
+else:
+    piece_areas = [water_extent_mask.area]
+print(
+    "    water_extent_mask piece area (deg^2) stats: "
+    f"n_pieces={len(piece_areas)}, min={min(piece_areas):.3e}, "
+    f"median={sorted(piece_areas)[len(piece_areas) // 2]:.3e}, "
+    f"max={max(piece_areas):.3e}"
+)
+
+# Remove very small polygons. Threshold is set relative to the largest
+# piece (rather than a fixed absolute number) so it scales correctly
+# regardless of the mask's actual area units - drops pieces under
+# water_extent_min_piece_fraction of the largest connected region.
+water_extent_min_piece_fraction = 0.001  # 0.1% of the largest piece
+water_extent_min_area = max(piece_areas) * water_extent_min_piece_fraction
+print(f"    remove_small_polygons: using min_area={water_extent_min_area:.3e} deg^2 "
+      f"({water_extent_min_piece_fraction:.1%} of largest piece)")
+
+water_extent_mask = pipe.remove_small_polygons(
+    water_extent_mask,
+    min_area=water_extent_min_area
+)
+
 print(f"Step 5a - build_water_extent_mask: polygon area="
       f"{water_extent_mask.area:.8f} deg^2, bounds={water_extent_mask.bounds}")
 _t("build_water_extent_mask")
@@ -112,9 +142,22 @@ if build_plots:
   pipe.plot_step(water_extent_mask, "step5a_water_extent_mask", output_dir,
               title="Step 5a: Water Extent Mask")
 
+# _t = _step_timer()
+# print(f"    water_extent_mask.is_valid = {water_extent_mask.is_valid}, "
+#       f"n_exterior_coords = {len(water_extent_mask.exterior.coords)}")
+
 _t = _step_timer()
-print(f"    water_extent_mask.is_valid = {water_extent_mask.is_valid}, "
-      f"n_exterior_coords = {len(water_extent_mask.exterior.coords)}")
+
+if water_extent_mask.geom_type == "MultiPolygon":
+    n_coords = sum(len(poly.exterior.coords) for poly in water_extent_mask.geoms)
+else:
+    n_coords = len(water_extent_mask.exterior.coords)
+
+print(
+    f"    water_extent_mask.is_valid = {water_extent_mask.is_valid}, "
+    f"n_exterior_coords = {n_coords}"
+)
+
 #intertidal_pixels = pipe.apply_water_extent_mask(candidates, water_extent_mask)
 intertidal_pixels, inside_mask = pipe.apply_water_extent_mask(
     candidates,
@@ -136,7 +179,8 @@ intertidal_pixels = pipe.estimate_pixel_uncertainty(intertidal_pixels)
 _t("estimate_pixel_uncertainty")
 
 _t = _step_timer()
-grid = pipe.gridify(pixc_full["azimuth_index"], pixc_full["range_index"], inside_mask)
+#grid = pipe.gridify(pixc_full["azimuth_index"], pixc_full["range_index"], inside_mask)
+grid = pipe.gridify(pixc_full["azimuth_index"], pixc_full["range_index"], open_water_mask)
 _t("gridify")
 if build_plots:
     pipe.plot_step(grid, "step5c_intertidal_grid", output_dir,
@@ -158,56 +202,31 @@ _t("gridify (lon/lat)")
 
 _t = _step_timer()
 
-# # Cluster points into spatially connected groups first 
-# _t = _step_timer()
-# water_gdf = pipe.cluster_points_to_polygons(
-#      water_pixels, "water", concave_hull_ratio=concave_hull_ratio
-# )
-# _t("cluster_points_to_polygons (water)")
-# print(f"Water polygons: {len(water_gdf)}")
-
-#_t = _step_timer()
-# intertidal_gdf = pipe.cluster_points_to_polygons(
-#     intertidal_pixels, "intertidal", concave_hull_ratio=concave_hull_ratio
-# )
-# _t("cluster_points_to_polygons (intertidal)")
-# print(f"Intertidal polygons (from filtered pixels only): {len(intertidal_gdf)}")
-
-# old method 
-
-# arrays = pipe.read_pixel_cloud_arrays(file)
-
-# grids = pipe.build_land_water_intertidal_grids(arrays)
-
-# grids = pipe.scatter_indices_to_grid(arrays)
-
-# keep_mask = pipe.scatter_indices_to_grid(
-#     intertidal_pixels["azimuth_index"],
-#     intertidal_pixels["range_index"],
-    #grids,
-#)
-
-#restricted = pipe.restrict_grids_to_mask(
-    #grids,
-   # keep_mask,
-#)
-
-#binary_mask = restricted["final_mask"]
-
-#intertidal_gdf = pipe.polygons_from_binary_mask(
-    #binary_mask,
-    #restricted["lon_grid"],
-    #restricted["lat_grid"],
-    #category="intertidal",
-#)
-
-
-# new method
 intertidal_gdf = pipe.polygons_from_raster_mask(
     grid, lon_grid, lat_grid, category="intertidal", fill_holes=True,
 )
 _t("polygons_from_raster_mask")
 print(f"Step 6 - polygons_from_raster_mask: {len(intertidal_gdf)} intertidal polygon(s)")
+
+if len(intertidal_gdf) > 0:
+    _areas_sorted = intertidal_gdf["area"].sort_values()
+    _pcts = [10, 25, 50, 75, 90, 95, 99]
+    _pct_str = ", ".join(
+        f"p{p}={_areas_sorted.quantile(p / 100):.3e}" for p in _pcts
+    )
+    print(
+        "    intertidal_gdf area (deg^2) stats: "
+        f"min={intertidal_gdf['area'].min():.3e}, {_pct_str}, "
+        f"max={intertidal_gdf['area'].max():.3e}"
+    )
+
+# drop final intertidal polygons smaller than min_intertidal_polygon_area
+n_before = len(intertidal_gdf)
+intertidal_gdf = pipe.remove_small_polygons(
+    intertidal_gdf, min_area=min_intertidal_polygon_area, area_col="area",
+)
+print(f"Step 6b - remove_small_polygons: kept {len(intertidal_gdf)} / {n_before} "
+      f"intertidal polygon(s) (min_area={min_intertidal_polygon_area} deg^2)")
 
 # export shapefile + KML for the intertidal category, if any polygons were found
 
