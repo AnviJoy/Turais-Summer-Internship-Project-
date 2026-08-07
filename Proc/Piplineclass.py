@@ -105,6 +105,13 @@ class SWOTPipelineConfig:
     min_region_points: int = 10
     raster_default_resolution_deg: float = 0.0001
 
+    # ratio passed to shapely's concave_hull when clustering scattered points into polygons (0 = tightest hull, 1 = convex hull)
+    concave_hull_ratio: float = 0.1
+    # minimum area (deg^2) a final intertidal polygon must have to be kept by remove_small_polygons
+    min_intertidal_polygon_area: float = 7.7e-5
+    # fraction of the largest water_extent_mask piece's area below which a disconnected piece is dropped by remove_small_polygons
+    water_extent_min_piece_fraction: float = 0.001
+
     # Variable name aliases for reading L2_HR_PIXC granules.
     pixc_var_aliases: dict = field(default_factory=lambda: {
         "height": ["height"],
@@ -862,7 +869,7 @@ class SWOTIntertidalPipeline:
     def cluster_points_to_polygons(self, df: pd.DataFrame, category: str,
                                     grid_res_deg: Optional[float] = None,
                                     min_region_points: Optional[int] = None,
-                                    concave_hull_ratio: float = 0.1,
+                                    concave_hull_ratio: Optional[float] = None,
                                     connectivity: int = 2,
                                     closing_disk_radius: Optional[int] = None) -> gpd.GeoDataFrame:
         """Split a scattered lon/lat point set into spatially connected
@@ -871,6 +878,8 @@ class SWOTIntertidalPipeline:
         grid_res_deg = grid_res_deg or self.cfg.mask_grid_res_deg
         min_region_points = (min_region_points if min_region_points is not None
                               else self.cfg.min_region_points)
+        concave_hull_ratio = (concave_hull_ratio if concave_hull_ratio is not None
+                               else self.cfg.concave_hull_ratio)
         closing_disk_radius = (closing_disk_radius if closing_disk_radius is not None
                                 else self.cfg.cluster_closing_disk_radius)
 
