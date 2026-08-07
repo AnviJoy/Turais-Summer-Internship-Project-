@@ -82,6 +82,8 @@ class SWOTPipelineConfig:
     mc_ci_alpha: float = 0.025
     # whether to remove pixels classified as dark water
     exclude_dark_water: bool = False
+    # whether to remove pixels classified as land
+    exclude_land: bool = False
     # smallest hole area (square degrees) kept when cleaning a polygon
     min_hole_area_deg2: float = 1e-8
     # window size used to smooth a polygon's boundary
@@ -1002,6 +1004,24 @@ class SWOTIntertidalPipeline:
         # before/after this call stays aligned to the same row labels.
         return pixc_df[~pixc_df["classification"].isin(
             self._dark_water_class_codes())]
+
+    def filter_land(self, pixc_df: pd.DataFrame,
+                     enabled: Optional[bool] = None) -> pd.DataFrame:
+        """Optionally drop pixels classified as land.
+
+        This can't be done without the pixel's `classification` flag —
+        there's no height/phase-noise signature that reliably separates
+        land from intertidal — but it's a simple isin() filter against
+        `cfg.land_class_code`, the same pattern as filter_dark_water,
+        not the heavier raster classification-grid workflow used
+        elsewhere in this file.
+        """
+        enabled = self.cfg.exclude_land if enabled is None else enabled
+        if not enabled:
+            return pixc_df
+        # index preserved (not reset) so any mask computed against pixc_df
+        # before/after this call stays aligned to the same row labels.
+        return pixc_df[pixc_df["classification"] != self.cfg.land_class_code]
 
     def remove_regional_gradient(self, pixc_df: pd.DataFrame,
                                   gradient_model=None) -> pd.DataFrame:
