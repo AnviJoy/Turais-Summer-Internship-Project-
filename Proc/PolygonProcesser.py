@@ -10,10 +10,14 @@ from shapely.geometry import MultiPolygon
 
 from Piplineclass import SWOTIntertidalPipeline, SWOTPipelineConfig
 
+#kirby
+#file = r"C:\Users\Lily Donaldson\Documents\Anvi\Python Codes\SWOT_L2_HR_PIXC_501_016_060L_20230425T064527_20230425T064532_PGC0_01.nc"
 
-file = r"C:\Users\Lily Donaldson\Documents\Anvi\Python Codes\SWOT_L2_HR_PIXC_501_016_060L_20230425T064527_20230425T064532_PGC0_01.nc"
+#weston
+#file = r"C:\Users\Lily Donaldson\Documents\Anvi\Python Codes\SWOT_L2_HR_PIXC_052_475_245R_20260706T065928_20260706T065939_PID0_01.nc"
 
-#r"C:\Users\pmalesza\Documents\Python Codes\SWOT_L2_HR_PIXC_052_475_245R_20260706T065928_20260706T065939_PID0_01.nc"
+#france
+file = r"C:\Users\Lily Donaldson\Documents\Anvi\Python Codes\SWOT_L2_HR_PIXC_053_348_073L_20260722T142201_20260722T142213_PID0_01.nc"
 
 output_base = r"C:\Users\Lily Donaldson\Documents\Anvi\SWOT_L2_HR_PIXC Output Polygons"
 
@@ -117,10 +121,7 @@ print(
     f"max={max(piece_areas):.3e}"
 )
 
-# Remove very small polygons. Threshold is set relative to the largest
-# piece (rather than a fixed absolute number) so it scales correctly
-# regardless of the mask's actual area units - drops pieces under
-# cfg.water_extent_min_piece_fraction of the largest connected region.
+# Remove very small polygons. Threshold is set relative to the largest piece (rather than a fixed absolute number) so it scales correctly
 water_extent_min_area = max(piece_areas) * cfg.water_extent_min_piece_fraction
 print(f"    remove_small_polygons: using min_area={water_extent_min_area:.3e} deg^2 "
       f"({cfg.water_extent_min_piece_fraction:.1%} of largest piece)")
