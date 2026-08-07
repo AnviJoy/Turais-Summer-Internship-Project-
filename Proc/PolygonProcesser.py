@@ -27,6 +27,7 @@ cycle = 52
 
 SHOW_PLOTS = False
 build_plots = False
+EXCLUDE_LAND = False   # turn land masking on/off
 
 
 def _step_timer():
@@ -83,6 +84,24 @@ if not pipe.cycle_has_reliable_xover(pixc):
 
 # dark-water pixels elsewhere in open ocean can create a spurious third PDF peak
 pixc = pipe.filter_dark_water(pixc)
+
+# land pixels can also pollute the h_a PDF / final polygons if left in
+n_before_land = len(pixc)
+if EXCLUDE_LAND:
+    # filter_land() only trims the `pixc` DataFrame - it doesn't update
+    # subset_mask. Without this, land pixels stay "True" all the way
+    # through phase_noise_mask -> open_water_mask -> the raster `grid`
+    # that the final polygons are built from, so the shapefile/KML come
+    # out identical whether EXCLUDE_LAND is True or False. Fold the land
+    # exclusion into subset_mask here (it's positionally aligned to
+    # pixc_full) so it propagates through the rest of the mask chain.
+    land_keep = (pixc_full["classification"] != cfg.land_class_code).to_numpy()
+    subset_mask = subset_mask & land_keep
+pixc = pipe.filter_land(pixc, enabled=EXCLUDE_LAND)
+if EXCLUDE_LAND:
+    print(f"Step 2b - filter_land: {len(pixc)} / {n_before_land} pixels kept")
+else:
+    print("Step 2b - filter_land: skipped (EXCLUDE_LAND=False)")
 
 
 # phase noise filter
@@ -199,7 +218,15 @@ _t("gridify (lon/lat)")
 _t = _step_timer()
 
 intertidal_gdf = pipe.polygons_from_raster_mask(
-    grid, lon_grid, lat_grid, category="intertidal", fill_holes=True,
+    grid, lon_grid, lat_grid, category="intertidal",
+    # fill_holes patches over *any* fully-enclosed gap in the mask,
+    # including land pixels we deliberately excluded - which is exactly
+    # the "real islets/rocks within a water body" case its docstring
+    # says to preserve. Keep it True (the old default) when land
+    # filtering is off, but turn it off when EXCLUDE_LAND is on so
+    # excluded land actually shows up as a hole instead of being
+    # silently patched back in.
+    fill_holes=not EXCLUDE_LAND,
 )
 _t("polygons_from_raster_mask")
 print(f"Step 6 - polygons_from_raster_mask: {len(intertidal_gdf)} intertidal polygon(s)")
