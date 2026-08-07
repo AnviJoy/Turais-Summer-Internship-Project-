@@ -52,13 +52,16 @@ class SWOTPipelineConfig:
     # random seed used for that subsampling, so results are repeatable
     kde_random_seed: Optional[int] = 0
     # how far the pdf must drop as a fraction of the peak to set the upper cutoff
-    eps_up_fraction: float = 0.01
+    #original: 0.01
+    eps_up_fraction: float = 0.02
     # divisor used to set the near-zero threshold when finding the lower cutoff
     #original: 50.0
-    eps_low_divisor: float = 50.0
+    eps_low_divisor: float = 40.0
     # grid cell size (degrees) used to build the water extent mask
+    #original: 0.0001
     mask_grid_res_deg: float = 0.0001
     # minimum validity quantile a grid cell needs to count as water
+    #original:0.90
     mask_validity_quantile: float = 0.90
     # radius used to close small gaps in the water mask before finding regions
     #original: 2
@@ -66,6 +69,7 @@ class SWOTPipelineConfig:
     # smallest blob size (in cells) kept after cleaning the water mask
     mask_min_object_size: int = 8
     # connectivity rule used when grouping mask cells into regions
+    #original:2
     mask_connectivity: int = 2
     # radius used to close gaps between scattered pixels before clustering them into polygons
     #original:4
@@ -136,7 +140,7 @@ class SWOTPipelineConfig:
 
     #subset = r"C:\Users\pmalesza\Documents\SWOT kml\subset.kml"
     
-    subset: str = r"C:\Users\Lily Donaldson\Documents\Anvi\SWOT kml\kirby_subset.kml"
+    subset: str = r"C:\Users\Lily Donaldson\Documents\Anvi\SWOT kml\france_subset.kml"
 
     # UK coastline reference line (KML), used to build a coastal buffer mask
     coastline_kml_path: str = r"C:\Users\Lily Donaldson\Documents\Anvi\SWOT kml\UK_coastline_500m_accuracy.kml"
