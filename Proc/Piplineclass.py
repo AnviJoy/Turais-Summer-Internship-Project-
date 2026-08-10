@@ -303,14 +303,6 @@ class SWOTIntertidalPipeline:
                             threshold: Optional[float] = None) -> pd.DataFrame:
         """Drop pixels with sigma_phase_noise above `threshold`, folding in
         the keep-mask from the previous pipeline step.
-
-        `mask` is the cumulative mask coming out of the previous step
-        (e.g. `subset_mask` from `subset_by_kml`) — either a plain boolean
-        array positioned like `pixc_df`'s original row order, or a boolean
-        Series sharing `pixc_df`'s index. The returned mask is the same
-        length/index as `mask` (i.e. still full-length relative to the
-        original pixel cloud), with this step's condition folded in, so it
-        can be passed straight into the next filtering step.
         """
         threshold = threshold if threshold is not None \
             else self.cfg.sigma_phase_noise_threshold
@@ -499,9 +491,7 @@ class SWOTIntertidalPipeline:
         validity_quantile = validity_quantile if validity_quantile is not None \
             else self.cfg.mask_validity_quantile
 
-        # Fold in the mask from the previous step: only pixels flagged True
-        # in `open_water_mask` count toward the validity grid used to build
-        # the extent polygon.
+        # Fold in the mask from the previous step
         mask_series = open_water_mask if isinstance(open_water_mask, pd.Series) \
             else pd.Series(np.asarray(open_water_mask), index=range(len(open_water_mask)))
         per_cycle_filtered_pixc = [
@@ -816,9 +806,6 @@ class SWOTIntertidalPipeline:
                 cleaned = candidate
             else:
                 # Smoothing produced a self-intersecting ring; repair it
-                # rather than silently handing an invalid geometry
-                # downstream (contains() checks against invalid polygons
-                # can be pathologically slow / appear to hang).
                 repaired = candidate.buffer(0)
                 if not repaired.is_empty:
                     if isinstance(repaired, MultiPolygon):
@@ -1019,8 +1006,6 @@ class SWOTIntertidalPipeline:
         enabled = self.cfg.exclude_land if enabled is None else enabled
         if not enabled:
             return pixc_df
-        # index preserved (not reset) so any mask computed against pixc_df
-        # before/after this call stays aligned to the same row labels.
         return pixc_df[pixc_df["classification"] != self.cfg.land_class_code]
 
     def remove_regional_gradient(self, pixc_df: pd.DataFrame,
