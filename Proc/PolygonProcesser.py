@@ -14,10 +14,10 @@ from Piplineclass import SWOTIntertidalPipeline, SWOTPipelineConfig
 #file = r"C:\Users\Lily Donaldson\Documents\Anvi\Python Codes\SWOT_L2_HR_PIXC_501_016_060L_20230425T064527_20230425T064532_PGC0_01.nc"
 
 #weston
-file = r"C:\Users\Lily Donaldson\Documents\Anvi\Python Codes\SWOT_L2_HR_PIXC_052_475_245R_20260706T065928_20260706T065939_PID0_01.nc"
+#file = r"C:\Users\Lily Donaldson\Documents\Anvi\Python Codes\SWOT_L2_HR_PIXC_052_475_245R_20260706T065928_20260706T065939_PID0_01.nc"
 
 #france
-#file = r"C:\Users\Lily Donaldson\Documents\Anvi\Python Codes\SWOT_L2_HR_PIXC_053_348_073L_20260722T142201_20260722T142213_PID0_01.nc"
+file = r"C:\Users\Lily Donaldson\Documents\Anvi\Python Codes\SWOT_L2_HR_PIXC_053_348_073L_20260722T142201_20260722T142213_PID0_01.nc"
 
 output_base = r"C:\Users\Lily Donaldson\Documents\Anvi\SWOT_L2_HR_PIXC Output Polygons"
 
@@ -25,9 +25,9 @@ output_base = r"C:\Users\Lily Donaldson\Documents\Anvi\SWOT_L2_HR_PIXC Output Po
 cycle = 52
 
 
-SHOW_PLOTS = False
+show_plots = False
 build_plots = False
-EXCLUDE_LAND = False   # turn land masking on/off
+exclude_land = False   # turn land masking on/off
 
 
 def _step_timer():
@@ -87,15 +87,15 @@ pixc = pipe.filter_dark_water(pixc)
 
 # land pixels can also pollute the h_a PDF / final polygons if left in
 n_before_land = len(pixc)
-if EXCLUDE_LAND:
-    # filter_land() only trims the `pixc` DataFrame
+if exclude_land:
+    # filter_land
     land_keep = (pixc_full["classification"] != cfg.land_class_code).to_numpy()
     subset_mask = subset_mask & land_keep
-pixc = pipe.filter_land(pixc, enabled=EXCLUDE_LAND)
-if EXCLUDE_LAND:
+pixc = pipe.filter_land(pixc, enabled=exclude_land)
+if exclude_land:
     print(f"Step 2b - filter_land: {len(pixc)} / {n_before_land} pixels kept")
 else:
-    print("Step 2b - filter_land: skipped (EXCLUDE_LAND=False)")
+    print("Step 2b - filter_land: skipped (exclude_land=False)")
 
 
 # phase noise filter
@@ -214,7 +214,7 @@ _t = _step_timer()
 intertidal_gdf = pipe.polygons_from_raster_mask(
     grid, lon_grid, lat_grid, category="intertidal",
     # fill_holes patches over *any* fully-enclosed gap in the mask
-    fill_holes=not EXCLUDE_LAND,
+    fill_holes=not exclude_land,
 )
 _t("polygons_from_raster_mask")
 print(f"Step 6 - polygons_from_raster_mask: {len(intertidal_gdf)} intertidal polygon(s)")
@@ -265,7 +265,7 @@ if len(intertidal_gdf) > 0:
     polygons_png = os.path.join(output_dir, "category_polygons.png")
     ax1.figure.savefig(polygons_png, dpi=150)
     print(f"Saved category polygons plot to {polygons_png}")
-    if SHOW_PLOTS:
+    if show_plots:
         plt.show()
     else:
         plt.close(ax1.figure)
