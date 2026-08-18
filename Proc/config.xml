@@ -1,0 +1,220 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<config>
+
+    <!-- Signal / statistical thresholds -->
+    <thresholds>
+        <!-- pixels with sigma phase noise above this value are dropped as unreliable -->
+        <!-- original: 0.08 -->
+        <sigma_phase_noise_threshold type="float">0.08</sigma_phase_noise_threshold>
+
+        <!-- raw values this large or bigger are treated as missing data -->
+        <fill_value_threshold type="float">1e30</fill_value_threshold>
+    </thresholds>
+
+    <!-- Reference point / PDF settings -->
+    <pdf>
+        <!-- buffer size around the reference open water point used to compute its median height -->
+        <ref_point_buffer_deg type="float">0.001</ref_point_buffer_deg>
+        <!-- bin width (m) for the height anomaly pdf -->
+        <pdf_bin_width_m type="float">0.05</pdf_bin_width_m>
+        <!-- minimum pdf density for a bump to count as a real peak -->
+        <pdf_peak_min_density type="float">0.10</pdf_peak_min_density>
+        <!-- maximum number of bins allowed when building the pdf -->
+        <pdf_max_bins type="int">2000</pdf_max_bins>
+        <!-- max number of points used to fit the kde; larger sets get randomly subsampled -->
+        <kde_max_samples type="int">400000</kde_max_samples>
+        <!-- random seed used for that subsampling, so results are repeatable -->
+        <kde_random_seed type="int">0</kde_random_seed>
+        <!-- bandwidth factor passed directly as bw_method to scipy's gaussian_kde -->
+        <kde_bw_scalar type="float">0.02</kde_bw_scalar>
+        <!-- how far the pdf must drop as a fraction of the peak to set the upper cutoff -->
+        <!-- original: 0.01 -->
+        <eps_up_fraction type="float">0.02</eps_up_fraction>
+        <!-- divisor used to set the near-zero threshold when finding the lower cutoff -->
+        <!-- original: 50.0 -->
+        <eps_low_divisor type="float">40.0</eps_low_divisor>
+    </pdf>
+
+    <!-- Water extent mask settings -->
+    <mask>
+        <!-- grid cell size (degrees) used to build the water extent mask -->
+        <!-- original: 0.0001 -->
+        <mask_grid_res_deg type="float">0.0001</mask_grid_res_deg>
+        <!-- minimum validity quantile a grid cell needs to count as water -->
+        <!-- original: 0.90 -->
+        <mask_validity_quantile type="float">0.90</mask_validity_quantile>
+        <!-- radius used to close small gaps in the water mask before finding regions -->
+        <!-- original: 2 -->
+        <mask_closing_disk_radius type="int">2</mask_closing_disk_radius>
+        <!-- smallest blob size (in cells) kept after cleaning the water mask -->
+        <mask_min_object_size type="int">8</mask_min_object_size>
+        <!-- connectivity rule used when grouping mask cells into regions -->
+        <!-- original: 2 -->
+        <mask_connectivity type="int">2</mask_connectivity>
+        <!-- radius used to close gaps between scattered pixels before clustering them into polygons -->
+        <!-- original: 4 -->
+        <cluster_closing_disk_radius type="int">4</cluster_closing_disk_radius>
+    </mask>
+
+    <!-- Toggles -->
+    <toggles>
+        <!-- whether to suppress all progress output -->
+        <silent type="bool">false</silent>
+        <!-- whether to exclude land pixels from the intertidal polygons -->
+        <exclude_land type="bool">false</exclude_land>
+        <!-- whether to build diagnostic plots -->
+        <build_plots type="bool">true</build_plots>
+        <!-- whether to show diagnostic plots -->
+        <show_plots type="bool">false</show_plots>
+        <!-- whether to run step 5 of the pipeline (polygon cleaning) -->
+        <step5 type="bool">false</step5>
+        <!-- whether to build the step 4 KDE peak diagnostic plot (peak.py logic) -->
+        <peak_diagnostic_plot type="bool">true</peak_diagnostic_plot>
+    </toggles>
+
+    <!-- Output grid / Monte Carlo settings -->
+    <output>
+        <!-- grid cell size (degrees) for the final aggregated output -->
+        <output_grid_res_deg type="float">0.00025</output_grid_res_deg>
+        <!-- number of Monte Carlo samples drawn per grid cell -->
+        <mc_realizations type="int">1000</mc_realizations>
+        <!-- tail probability used to compute the confidence interval -->
+        <mc_ci_alpha type="float">0.025</mc_ci_alpha>
+    </output>
+
+    <!-- Pixel exclusion flags -->
+    <exclusions>
+        <!-- whether to remove pixels classified as dark water -->
+        <exclude_dark_water type="bool">false</exclude_dark_water>
+    </exclusions>
+
+    <!-- Polygon cleaning settings -->
+    <polygon>
+        <!-- smallest hole area (square degrees) kept when cleaning a polygon -->
+        <min_hole_area_deg2 type="float">1e-8</min_hole_area_deg2>
+        <!-- window size used to smooth a polygon's boundary -->
+        <!-- original: 5 -->
+        <smoothing_window type="int">5</smoothing_window>
+        <!-- ratio passed to shapely's concave_hull when clustering scattered points into polygons (0 = tightest hull, 1 = convex hull) -->
+        <concave_hull_ratio type="float">0.1</concave_hull_ratio>
+        <!-- minimum area (deg^2) a final intertidal polygon must have to be kept by remove_small_polygons -->
+        <min_intertidal_polygon_area type="float">7.7e-5</min_intertidal_polygon_area>
+        <!-- fraction of the largest water_extent_mask piece's area below which a disconnected piece is dropped by remove_small_polygons -->
+        <water_extent_min_piece_fraction type="float">0.001</water_extent_min_piece_fraction>
+    </polygon>
+
+    <!-- Classification codes / grid settings -->
+    <classification>
+        <!-- placeholders — confirm against the PDD/ATBD classification table -->
+        <open_water_class_codes type="tuple">
+            <value type="int">3</value>
+            <value type="int">4</value>
+        </open_water_class_codes>
+        <dark_water_class_codes type="tuple">
+            <value type="int">5</value>
+            <value type="int">6</value>
+        </dark_water_class_codes>
+
+        <land_class_code type="int">1</land_class_code>
+        <water_class_codes type="tuple">
+            <value type="int">4</value>
+        </water_class_codes>
+        <intertidal_class_codes type="tuple">
+            <value type="int">2</value>
+            <value type="int">3</value>
+        </intertidal_class_codes>
+
+        <quality_flag_names type="tuple">
+            <value type="str">classification_qual</value>
+            <value type="str">interferogram_qual</value>
+            <value type="str">sig0_qual</value>
+            <value type="str">geolocation_qual</value>
+        </quality_flag_names>
+
+        <land_closing_disk_radius type="int">2</land_closing_disk_radius>
+        <land_min_object_size type="int">50</land_min_object_size>
+        <land_connectivity type="int">2</land_connectivity>
+        <min_region_points type="int">10</min_region_points>
+        <raster_default_resolution_deg type="float">0.0001</raster_default_resolution_deg>
+    </classification>
+
+    <!-- Variable name aliases for reading L2_HR_PIXC granules -->
+    <pixc_var_aliases>
+        <alias key="height">
+            <value type="str">height</value>
+        </alias>
+        <alias key="sigma_phase_noise">
+            <value type="str">phase_noise_std</value>
+            <value type="str">sigma_phase_noise</value>
+            <value type="str">phase_noise_sigma</value>
+        </alias>
+        <alias key="dh_dphi">
+            <value type="str">dheight_dphase</value>
+            <value type="str">dh_dphi</value>
+            <value type="str">dhdphi</value>
+        </alias>
+        <alias key="geolocation_qual">
+            <value type="str">geolocation_qual</value>
+            <value type="str">geoloc_qual</value>
+            <value type="str">geo_qual</value>
+        </alias>
+        <alias key="classification">
+            <value type="str">classification</value>
+            <value type="str">classification_flag</value>
+        </alias>
+        <alias key="latitude">
+            <value type="str">latitude</value>
+            <value type="str">lat</value>
+        </alias>
+        <alias key="longitude">
+            <value type="str">longitude</value>
+            <value type="str">lon</value>
+        </alias>
+        <alias key="azimuth_index">
+            <value type="str">azimuth_index</value>
+            <value type="str">az_index</value>
+        </alias>
+        <alias key="range_index">
+            <value type="str">range_index</value>
+            <value type="str">rg_index</value>
+        </alias>
+    </pixc_var_aliases>
+
+    <!-- Optional variables: read if present, otherwise just warn -->
+    <pixc_optional_var_aliases>
+        <alias key="height_cor_xover">
+            <value type="str">height_cor_xover</value>
+        </alias>
+        <alias key="geoid">
+            <value type="str">geoid</value>
+        </alias>
+        <alias key="solid_earth_tide">
+            <value type="str">solid_earth_tide</value>
+        </alias>
+        <alias key="load_tide_fes">
+            <value type="str">load_tide_fes</value>
+        </alias>
+        <alias key="pole_tide">
+            <value type="str">pole_tide</value>
+        </alias>
+    </pixc_optional_var_aliases>
+
+    <!-- File paths -->
+    <paths>
+        <!-- subset = r"C:\Users\pmalesza\Documents\SWOT kml\subset.kml" (commented out in original) -->
+        <subset type="str">/data/Turais/DATA/Kmls/Heysham_big_subset.kml</subset>
+
+        <!-- UK coastline reference line (KML), used to build a coastal buffer mask -->
+        <!-- alt: C:\Users\pmalesza\Documents\SWOT kml\UK_coastline_500m_accuracy.kml -->
+        <coastline_kml_path type="str">/data/Turais/DATA/Kmls/UK_coastline_500m_accuracy.kml</coastline_kml_path>
+    </paths>
+
+    <!-- Coastline buffering settings -->
+    <coastline>
+        <!-- distance (km) either side of the coastline kept as the coastal corridor mask -->
+        <coastline_buffer_km type="float">5.0</coastline_buffer_km>
+        <!-- projected CRS used when buffering the coastline so the buffer distance is in real metres -->
+        <coastline_projected_crs type="str">EPSG:27700</coastline_projected_crs>
+    </coastline>
+
+</config>
