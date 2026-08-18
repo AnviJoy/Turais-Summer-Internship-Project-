@@ -32,132 +32,15 @@ from rasterio.transform import rowcol
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 
+from config_loader import load_config
+
 @dataclass
-class SWOTPipelineConfig:
-    """Tunable thresholds for the pipeline, defaults from the paper's pseudocode."""
-
-    # pixels with sigma phase noise above this value are dropped as unreliable
-    #original: 0.08
-    sigma_phase_noise_threshold: float = 0.08
-    # buffer size around the reference open water point used to compute its median height
-    ref_point_buffer_deg: float = 0.001
-    # bin width (m) for the height anomaly pdf
-    pdf_bin_width_m: float = 0.05
-    # minimum pdf density for a bump to count as a real peak
-    pdf_peak_min_density: float = 0.10
-    # maximum number of bins allowed when building the pdf
-    pdf_max_bins: int = 2000
-    # max number of points used to fit the kde; larger sets get randomly subsampled
-    kde_max_samples: Optional[int] = 50_000
-    # random seed used for that subsampling, so results are repeatable
-    kde_random_seed: Optional[int] = 0
-    # how far the pdf must drop as a fraction of the peak to set the upper cutoff
-    #original: 0.01
-    eps_up_fraction: float = 0.02
-    # divisor used to set the near-zero threshold when finding the lower cutoff
-    #original: 50.0
-    eps_low_divisor: float = 40.0
-    # grid cell size (degrees) used to build the water extent mask
-    #original: 0.0001
-    mask_grid_res_deg: float = 0.0001
-    # minimum validity quantile a grid cell needs to count as water
-    #original:0.90
-    mask_validity_quantile: float = 0.90
-    # radius used to close small gaps in the water mask before finding regions
-    #original: 2
-    mask_closing_disk_radius: int = 2
-    # smallest blob size (in cells) kept after cleaning the water mask
-    mask_min_object_size: int = 8
-    # connectivity rule used when grouping mask cells into regions
-    #original:2
-    mask_connectivity: int = 2
-    # radius used to close gaps between scattered pixels before clustering them into polygons
-    #original:4
-    cluster_closing_disk_radius: int = 4
-    # grid cell size (degrees) for the final aggregated output
-    output_grid_res_deg: float = 0.00025
-    # number of Monte Carlo samples drawn per grid cell
-    mc_realizations: int = 1000
-    # tail probability used to compute the confidence interval
-    mc_ci_alpha: float = 0.025
-    # whether to remove pixels classified as dark water
-    exclude_dark_water: bool = False
-    # whether to remove pixels classified as land
-    exclude_land: bool = False
-    # smallest hole area (square degrees) kept when cleaning a polygon
-    min_hole_area_deg2: float = 1e-8
-    # window size used to smooth a polygon's boundary
-    #original: 5
-    smoothing_window: int = 5
-
-    # raw values this large or bigger are treated as missing data
-    fill_value_threshold: float = 1e30
-
-    # placeholders — confirm against the PDD/ATBD classification table.
-    open_water_class_codes: tuple = (3, 4)
-    dark_water_class_codes: tuple = (5, 6)
-
-    # classification codes / grid settings 
-    land_class_code: int = 1
-    water_class_codes: tuple = (4,)
-    intertidal_class_codes: tuple = (2, 3)
-    quality_flag_names: tuple = (
-        "classification_qual", "interferogram_qual",
-        "sig0_qual", "geolocation_qual",
-    )
-    land_closing_disk_radius: int = 2
-    land_min_object_size: int = 50
-    land_connectivity: int = 2
-    min_region_points: int = 10
-    raster_default_resolution_deg: float = 0.0001
-
-    # ratio passed to shapely's concave_hull when clustering scattered points into polygons (0 = tightest hull, 1 = convex hull)
-    concave_hull_ratio: float = 0.1
-    # minimum area (deg^2) a final intertidal polygon must have to be kept by remove_small_polygons
-    min_intertidal_polygon_area: float = 7.7e-5
-    # fraction of the largest water_extent_mask piece's area below which a disconnected piece is dropped by remove_small_polygons
-    water_extent_min_piece_fraction: float = 0.001
-
-    # Variable name aliases for reading L2_HR_PIXC granules.
-    pixc_var_aliases: dict = field(default_factory=lambda: {
-        "height": ["height"],
-        "sigma_phase_noise": ["phase_noise_std", "sigma_phase_noise", "phase_noise_sigma"],
-        "dh_dphi": ["dheight_dphase", "dh_dphi", "dhdphi"],
-        "geolocation_qual": ["geolocation_qual", "geoloc_qual", "geo_qual"],
-        "classification": ["classification", "classification_flag"],
-        "latitude": ["latitude", "lat"],
-        "longitude": ["longitude", "lon"],
-        "azimuth_index": ["azimuth_index", "az_index"],
-        "range_index": ["range_index", "rg_index"],
-    })
-
-    # Optional variables: read if present, otherwise just warn.
-    pixc_optional_var_aliases: dict = field(default_factory=lambda: {
-        "height_cor_xover": ["height_cor_xover"],
-        "geoid": ["geoid"],
-        "solid_earth_tide": ["solid_earth_tide"],
-        "load_tide_fes": ["load_tide_fes"],
-        "pole_tide": ["pole_tide"],
-    })
-
-    #subset = r"C:\Users\pmalesza\Documents\SWOT kml\subset.kml"
-    
-    subset: str = r"C:\Users\Lily Donaldson\Documents\Anvi\SWOT kml\france_subset.kml"
-
-    # UK coastline reference line (KML), used to build a coastal buffer mask
-    coastline_kml_path: str = r"C:\Users\Lily Donaldson\Documents\Anvi\SWOT kml\UK_coastline_500m_accuracy.kml"
-    #r"C:\Users\pmalesza\Documents\SWOT kml\UK_coastline_500m_accuracy.kml"
-    # distance (km) either side of the coastline kept as the coastal corridor mask
-    coastline_buffer_km: float = 5.0
-    # projected CRS used when buffering the coastline so the buffer distance is in real metres
-    coastline_projected_crs: str = "EPSG:27700"
-
 class SWOTIntertidalPipeline:
     """SWOT L2_HR_PIXC to intertidal topography pipeline, following the paper's method."""
 
-    def __init__(self, config: Optional[SWOTPipelineConfig] = None):
+    def __init__(self, config: Optional[load_config] = None):
         """Store the config (or defaults) and reset the cached water extent mask."""
-        self.cfg = config or SWOTPipelineConfig()
+        self.cfg = load_config("config.xml")
         self._water_extent_mask = None
 
     def read_pixel_cloud(self, filepath: str, cycle: Optional[int] = None,
@@ -259,6 +142,7 @@ class SWOTIntertidalPipeline:
         df = pixc_df.copy()
 
         good_geo = df[df["geolocation_qual"] == 0]
+        #good_geo = df[df["geolocation_qual"] <= 4]
         if good_geo.empty:
             raise ValueError("No pixels with geolocation_qual == 0 found; "
                               "cannot locate a reference pixel.")
@@ -316,8 +200,6 @@ class SWOTIntertidalPipeline:
         phase_noise_mask = mask_series.copy()
         phase_noise_mask.loc[pixc_df.index] = combined
 
-        # index preserved (not reset) so `phase_noise_mask` stays aligned
-        # with `thres` for the next step in the chain.
         thres = pixc_df[combined]
         return thres, phase_noise_mask
 
@@ -341,9 +223,9 @@ class SWOTIntertidalPipeline:
         n_bins = min(n_bins, self.cfg.pdf_max_bins)
         grid = np.linspace(h_a.min(), h_a.max(), n_bins)
 
-        kde = stats.gaussian_kde(h_a)
+        kde = stats.gaussian_kde(h_a, bw_method=self.cfg.kde_bw_scalar)
         pdf = kde(grid)
-        return grid, pdf, kde
+        return grid, pdf, kde, h_a
 
     def find_pdf_peaks(self, grid: np.ndarray, pdf: np.ndarray,
                         min_density: Optional[float] = None) -> np.ndarray:
@@ -450,7 +332,7 @@ class SWOTIntertidalPipeline:
     def filter_open_water(self, pixc_df: pd.DataFrame, phase_noise_mask) -> pd.DataFrame: 
         """Return candidate non-open-water pixels (h_a within the Step 4 cutoffs)."""
         h_a = pixc_df["h_a"].to_numpy()
-        grid, pdf, _ = self._kde_pdf(h_a)
+        grid, pdf, h_a, _ = self._kde_pdf(h_a)
 
         peaks_idx = self.find_pdf_peaks(grid, pdf)
         if peaks_idx.size == 0:
@@ -463,10 +345,6 @@ class SWOTIntertidalPipeline:
 
         own_cond = (pixc_df["h_a"] >= h_a_lower) & (pixc_df["h_a"] <= h_a_upper)
 
-        # `phase_noise_mask` may be full-length (indexed like the original
-        # pixel cloud) while `pixc_df` here is already restricted to the
-        # phase-noise-kept rows — reindex/align by label rather than by
-        # raw `&`, which would otherwise silently misalign the two Series.
         mask_series = phase_noise_mask if isinstance(phase_noise_mask, pd.Series) \
             else pd.Series(np.asarray(phase_noise_mask), index=range(len(phase_noise_mask)))
 
@@ -491,7 +369,6 @@ class SWOTIntertidalPipeline:
         validity_quantile = validity_quantile if validity_quantile is not None \
             else self.cfg.mask_validity_quantile
 
-        # Fold in the mask from the previous step
         mask_series = open_water_mask if isinstance(open_water_mask, pd.Series) \
             else pd.Series(np.asarray(open_water_mask), index=range(len(open_water_mask)))
         per_cycle_filtered_pixc = [
@@ -643,12 +520,6 @@ class SWOTIntertidalPipeline:
         """Vectorise a binary az/range mask into polygons that trace each
         region's actual pixel boundary, instead of convex-hulling its
         points like `polygons_from_binary_mask` does.
-
-        `fill_holes`: if True (default), fully-enclosed background gaps
-        inside a region (a stray dropped pixel, a KDE cutoff excluding one
-        cell, etc.) are filled in before tracing, so the resulting polygon
-        has no interior holes. Set False if small enclosed features (real
-        islets/rocks within a water body) should be preserved as holes.
         """
         mask_bool = np.asarray(binary_mask, dtype=bool)
         if fill_holes:
@@ -785,14 +656,8 @@ class SWOTIntertidalPipeline:
         coords = np.array(cleaned.exterior.coords)
         w = self.cfg.smoothing_window
         if w > 1 and len(coords) > w:
-            # `coords` is a closed ring (first point == last point). A plain
-            # np.convolve(..., mode="same") zero-pads both ends as if the
-            # curve were open, which distorts the boundary right at the
-            # seam and can leave the smoothed ring self-intersecting
-            # (invalid). Pad circularly instead so the smoothing wraps
-            # around the closure, then re-close the ring explicitly.
             pad = w // 2
-            open_coords = coords[:-1]  # drop duplicated closing point
+            open_coords = coords[:-1]  
             padded = np.vstack([open_coords[-pad:], open_coords, open_coords[:pad]]) \
                 if pad > 0 else open_coords
             kernel = np.ones(w) / w
@@ -805,7 +670,6 @@ class SWOTIntertidalPipeline:
             if candidate.is_valid and not candidate.is_empty:
                 cleaned = candidate
             else:
-                # Smoothing produced a self-intersecting ring; repair it
                 repaired = candidate.buffer(0)
                 if not repaired.is_empty:
                     if isinstance(repaired, MultiPolygon):
@@ -823,12 +687,6 @@ class SWOTIntertidalPipeline:
     def apply_water_extent_mask(self, candidates_df: pd.DataFrame,
                                  mask_polygon=None, base_mask=None) -> pd.DataFrame:
         """Keep only candidate pixels that fall inside the water extent mask.
-
-        If `base_mask` (the cumulative mask from the previous step, e.g.
-        `open_water_mask`) is given, the returned mask is expanded to that
-        same full length/index instead of being positional-only relative
-        to `candidates_df`, so it stays consistent with the rest of the
-        chain and can be plotted the same way as the earlier step masks.
         """
         mask_polygon = mask_polygon or self._water_extent_mask
         if mask_polygon is None:
@@ -836,9 +694,6 @@ class SWOTIntertidalPipeline:
                               "call build_water_extent_mask first.")
 
         if not mask_polygon.is_valid:
-            # Point-in-polygon tests against an invalid (e.g. self-
-            # intersecting) polygon can be pathologically slow in GEOS,
-            # which looks like a hang rather than an error. Repair first.
             warnings.warn("water_extent_mask is invalid; repairing with buffer(0) "
                            "before running containment checks.")
             repaired = mask_polygon.buffer(0)
@@ -902,10 +757,6 @@ class SWOTIntertidalPipeline:
         occ[row, col] = True
 
         if closing_disk_radius and closing_disk_radius > 0:
-            # Bridge gaps between real pixels that are physically part of
-            # the same water body but whose spacing skips grid cells.
-            # binary_closing (dilate then erode) connects nearby occupied
-            # cells without merging genuinely distant, unrelated clusters.
             occ_for_labeling = binary_closing(occ, disk(closing_disk_radius))
         else:
             occ_for_labeling = occ
@@ -913,11 +764,6 @@ class SWOTIntertidalPipeline:
         structure = np.ones((3, 3)) if connectivity == 2 else None
         labelled, num_features = label(occ_for_labeling, structure=structure)
         point_labels = labelled[row, col]
-
-        # Group point indices by cluster label in one pass instead of
-        # looping `region_id in range(1, num_features+1)` and rescanning
-        # the full point array each time (O(num_clusters x n_points),
-        # which explodes when there are many small/noisy clusters).
         order = np.argsort(point_labels, kind="stable")
         sorted_labels = point_labels[order]
         unique_labels, start_idx, counts = np.unique(
@@ -927,7 +773,7 @@ class SWOTIntertidalPipeline:
         records = []
         for region_id, start, n in zip(unique_labels, start_idx, counts):
             if region_id == 0:
-                continue  # background, shouldn't occur but guard anyway
+                continue 
             n = int(n)
             if n < min_region_points:
                 continue
@@ -968,9 +814,6 @@ class SWOTIntertidalPipeline:
             warnings.warn("No reference pixel recorded on this DataFrame.")
             return False
         lat, lon = ref_latlon
-        # .loc, not .iloc: idxmin() returns an index *label*, and pixc_df's
-        # index is no longer guaranteed to be a plain 0..N-1 range now that
-        # earlier steps preserve original row labels for mask alignment.
         row = pixc_df.loc[
             ((pixc_df["latitude"] - lat).abs() +
              (pixc_df["longitude"] - lon).abs()).idxmin()
@@ -995,13 +838,6 @@ class SWOTIntertidalPipeline:
     def filter_land(self, pixc_df: pd.DataFrame,
                      enabled: Optional[bool] = None) -> pd.DataFrame:
         """Optionally drop pixels classified as land.
-
-        This can't be done without the pixel's `classification` flag —
-        there's no height/phase-noise signature that reliably separates
-        land from intertidal — but it's a simple isin() filter against
-        `cfg.land_class_code`, the same pattern as filter_dark_water,
-        not the heavier raster classification-grid workflow used
-        elsewhere in this file.
         """
         enabled = self.cfg.exclude_land if enabled is None else enabled
         if not enabled:
@@ -1367,17 +1203,6 @@ class SWOTIntertidalPipeline:
     def remove_small_polygons(self, geometry, min_area, area_col: Optional[str] = None):
        """
        Remove polygons smaller than min_area.
-
-       Accepts a single Polygon, a MultiPolygon, or a GeoDataFrame of
-       polygons:
-         - Polygon: returns the polygon unchanged, or an empty Polygon()
-           if its area is below min_area.
-         - MultiPolygon: returns a MultiPolygon containing only the
-           member polygons at or above min_area (Polygon()/single Polygon
-           if 0 or 1 remain).
-         - GeoDataFrame: returns a copy with rows below min_area dropped.
-           If `area_col` is given and present, that column is used
-           directly instead of recomputing `geometry.area` per row.
        """
        if isinstance(geometry, gpd.GeoDataFrame):
            if len(geometry) == 0:
@@ -1508,10 +1333,6 @@ class SWOTIntertidalPipeline:
 
         mask = vectorized.contains(poly, lon, lat) | vectorized.touches(poly, lon, lat)
 
-        # NOTE: index is intentionally NOT reset here. Keeping the original
-        # pixc_df row labels lets `mask` (and every mask derived from it in
-        # later steps) stay aligned to the same reference frame, so masks
-        # can be chained together with straightforward boolean indexing.
         subset = pixc_df[mask]
         print(f"Kept {int(mask.sum())}/{len(pixc_df)} points inside {kml_path}")
         return subset, mask
@@ -1696,7 +1517,10 @@ class SWOTIntertidalPipeline:
     
     def plot_step(self, data, step_name: str, output_dir: str, *,
                   value_col: Optional[str] = None, title: Optional[str] = None,
-                  cmap: str = "viridis", dpi: int = 150, show: bool = False):
+                  cmap: str = "viridis", dpi: int = 150, show: bool = False,
+                  vmin: Optional[float] = None, vmax: Optional[float] = None,
+                  xlim: Optional[tuple] = None,
+                  ylim: Optional[tuple] = None):
         """Generic diagnostic plotting for a pipeline step. Inspects the type of data and picks a sensible default view, then
         saves a png to file directory.
         """
@@ -1749,7 +1573,7 @@ class SWOTIntertidalPipeline:
                     c = None
                     if value_col and value_col in data.columns:
                         c = data[value_col].to_numpy()
-                    sc = ax.scatter(lon, lat, c=c, s=2, cmap=cmap)
+                    sc = ax.scatter(lon, lat, c=c, s=2, cmap=cmap, vmin=vmin, vmax=vmax)
                     if c is not None:
                         cbar = plt.colorbar(sc, ax=ax)
                         cbar.set_label(value_col)
@@ -1761,7 +1585,7 @@ class SWOTIntertidalPipeline:
                         ax.set_aspect(aspect)
                     made_plot = True
                 elif value_col and value_col in data.columns and len(data) > 0:
-                    ax.hist(data[value_col].to_numpy(), bins=50, color="steelblue")
+                    ax.hist(data[value_col].to_numpy(), bins=3000, color="steelblue")
                     ax.set_xlabel(value_col)
                     ax.set_ylabel("Count")
                     made_plot = True
@@ -1791,12 +1615,15 @@ class SWOTIntertidalPipeline:
 
             elif isinstance(data, np.ndarray) and data.ndim == 1:
                 if data.size > 0:
-                    ax.hist(data, bins=50, color="steelblue")
+                    ax.hist(data, bins=3000, color="steelblue")
                     made_plot = True
 
             if not made_plot:
                 ax.text(0.5, 0.5, "No data to plot", ha="center", va="center",
                          transform=ax.transAxes)
+
+            if xlim is not None:
+                ax.set_xlim(xlim)
 
             ax.set_title(plot_title)
             plt.tight_layout()
@@ -1816,14 +1643,6 @@ class SWOTIntertidalPipeline:
                         dpi: int = 150, show: bool = False):
         """Scatter-plot a boolean pixel mask (kept vs. dropped) over the
         lon/lat of `base_df`.
-
-        `plot_step` doesn't have a branch for a raw boolean array/Series,
-        so a mask handed to it (subset_mask, phase_noise_mask,
-        open_water_mask, ...) either gets silently histogrammed or falls
-        through to "No data to plot". This method is the one to use for
-        those masks instead: it aligns `mask` to `base_df`'s rows (by
-        label if `mask` is a Series, otherwise by position) and colors
-        each point by whether it was kept.
         """
         mask_arr = mask.to_numpy() if isinstance(mask, pd.Series) else np.asarray(mask)
 
