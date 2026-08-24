@@ -20,6 +20,7 @@ from shapely.geometry import Point
 from shapely import vectorized
 from skimage.morphology import remove_small_objects, closing as binary_closing, disk
 from scipy.ndimage import binary_fill_holes
+from scipy.ndimage import distance_transform_edt
 from shapely.geometry import MultiPoint
 import geopandas as gpd
 from scipy.ndimage import label
@@ -31,6 +32,8 @@ from rasterio.features import rasterize
 from rasterio.transform import rowcol
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
+from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 
 from config_loader import load_config
 
@@ -124,6 +127,47 @@ class SWOTIntertidalPipeline:
                     continue
             return root
 
+    def filter_quality_flags(self, pixc_df: pd.DataFrame, verbose: bool = True) -> pd.DataFrame:
+        """Keep only pixels where geolocation_qual, interferogram_qual, and
+        sig0_qual are all 0. 
+        """
+        required = ["geolocation_qual", "interferogram_qual", "sig0_qual"]
+        missing = [c for c in required if c not in pixc_df.columns]
+        if missing:
+            raise ValueError(
+                f"filter_quality_flags: missing required column(s): {missing}. ")
+
+        keep = (
+            (pixc_df["geolocation_qual"] == 0) &
+            (pixc_df["interferogram_qual"] == 0) &
+            (pixc_df["sig0_qual"] == 0)
+        )
+
+        if verbose:
+            for col in required:
+                n_zero = int((pixc_df[col] == 0).sum())
+                print(f"    {col} == 0: {n_zero} / {len(pixc_df)} pixels")
+
+        filtered = pixc_df[keep].reset_index(drop=True)
+
+        if verbose:
+            print(
+                f"Step 0 - filter_quality_flags: {len(filtered)} / {len(pixc_df)} "
+                "pixels kept (geolocation_qual, interferogram_qual, sig0_qual "
+                "all == 0; classification not checked)"
+            )
+
+        if filtered.empty:
+            warnings.warn(
+                "filter_quality_flags: 0 pixels passed. These qual fields "
+                "are bitmasks, not booleans -- run "
+                "pixc_df['geolocation_qual'].value_counts() (and the same "
+                "for interferogram_qual / sig0_qual) to see which bits are "
+                "actually set before assuming this is a bug."
+            )
+
+        return filtered
+
     def cycle_has_reliable_xover(self, pixc_df: pd.DataFrame,
                                   max_missing_frac: float = 0.5) -> bool:
         """Return False if height_cor_xover is absent or mostly missing for this cycle."""
@@ -142,7 +186,6 @@ class SWOTIntertidalPipeline:
         df = pixc_df.copy()
 
         good_geo = df[df["geolocation_qual"] == 0]
-        #good_geo = df[df["geolocation_qual"] <= 4]
         if good_geo.empty:
             raise ValueError("No pixels with geolocation_qual == 0 found; "
                               "cannot locate a reference pixel.")
@@ -199,6 +242,9 @@ class SWOTIntertidalPipeline:
 
         phase_noise_mask = mask_series.copy()
         phase_noise_mask.loc[pixc_df.index] = combined
+
+        #phase_noise_mask = pd.Series(False, index=mask_series.index)
+        #phase_noise_mask.loc[pixc_df.index] = combined
 
         thres = pixc_df[combined]
         return thres, phase_noise_mask
@@ -353,6 +399,9 @@ class SWOTIntertidalPipeline:
         open_water_mask = mask_series.copy()
         open_water_mask.loc[pixc_df.index] = combined
 
+        #open_water_mask = pd.Series(False, index=mask_series.index)
+        #open_water_mask.loc[pixc_df.index] = combined
+
         candidates = pixc_df[combined]
 
         candidates.attrs.update({
@@ -448,6 +497,33 @@ class SWOTIntertidalPipeline:
         # cleaned = self._clean_polygon(largest)
         # self._water_extent_mask = cleaned
         # return cleaned
+
+    def water_extent_gdf(self, water_extent_mask) -> gpd.GeoDataFrame:
+        """Wrap the water_extent_mask (Multi)Polygon into a per-piece
+        GeoDataFrame -- one row per disconnected piece -- mirroring the row
+        structure of `polygons_from_raster_mask` so `water` can be exported
+        and plotted the same way `intertidal` is, via
+        `export_polygons_shapefile`, `export_polygons_kml`, and
+        `plot_category_polygons`. No pieces are dropped here.
+        """
+        geoms = list(water_extent_mask.geoms) if water_extent_mask.geom_type == "MultiPolygon" \
+            else [water_extent_mask]
+
+        records = []
+        for region_id, geom in enumerate(geoms, start=1):
+            if geom is None or geom.is_empty:
+                continue
+            centroid = geom.centroid
+            records.append({
+                "category": "water",
+                "region_id": region_id,
+                "area": geom.area,
+                "cent_lon": centroid.x,
+                "cent_lat": centroid.y,
+                "geometry": geom,
+            })
+
+        return gpd.GeoDataFrame(records, geometry="geometry", crs="EPSG:4326")
     
     def polygons_from_binary_mask(
         self,
@@ -516,6 +592,10 @@ class SWOTIntertidalPipeline:
         lat_grid,
         category="intertidal",
         fill_holes=True,
+        corner_fill_max_radius=3,
+        verbose=True,
+        output_dir: Optional[str] = None,
+        show: bool = False,
     ):
         """Vectorise a binary az/range mask into polygons that trace each
         region's actual pixel boundary, instead of convex-hulling its
@@ -525,11 +605,36 @@ class SWOTIntertidalPipeline:
         if fill_holes:
             mask_bool = binary_fill_holes(mask_bool, structure=np.ones((3, 3)))
 
+        if output_dir is not None:
+            self.plot_step(
+                mask_bool, f"{category}_mask_bool", output_dir,
+                title=f"{category.title()}: mask_bool (post fill_holes={fill_holes})",
+                show=show,
+            )
+
+        lon_filled, lat_filled, n_filled = self._fill_grid_nearest(
+            lon_grid, lat_grid, max_radius=corner_fill_max_radius
+        )
+        if verbose and n_filled > 0:
+            print(
+                f"    polygons_from_raster_mask: filled {n_filled} gap cell(s) in "
+                f"lon/lat grid using nearest populated cell (max_radius="
+                f"{corner_fill_max_radius})"
+            )
+
         labelled_array, num_features = label(
             mask_bool, structure=np.ones((3, 3))
         )
 
+        if output_dir is not None:
+                    self.plot_step(
+                        mask_bool, f"{category}_mask_bool", output_dir,
+                        title=f"{category.title()}: mask_bool (post fill_holes={fill_holes})",
+                        show=show,
+                    )
+
         records = []
+        n_dropped_pieces = 0
         for region_id in range(1, num_features + 1):
             region_mask = labelled_array == region_id
             num_points = int(region_mask.sum())
@@ -546,7 +651,10 @@ class SWOTIntertidalPipeline:
                 continue
             pixel_polygon = pixel_polys[0] if len(pixel_polys) == 1 else unary_union(pixel_polys)
 
-            lonlat_polygon = self._pixel_polygon_to_lonlat(pixel_polygon, lon_grid, lat_grid)
+            lonlat_polygon, dropped = self._pixel_polygon_to_lonlat(
+                pixel_polygon, lon_filled, lat_filled
+            )
+            n_dropped_pieces += dropped
             if lonlat_polygon is None or lonlat_polygon.is_empty:
                 continue
 
@@ -561,6 +669,13 @@ class SWOTIntertidalPipeline:
                 "geometry": lonlat_polygon,
             })
 
+        if verbose and n_dropped_pieces > 0:
+            print(
+                f"    polygons_from_raster_mask: {n_dropped_pieces} polygon piece(s) "
+                f"still dropped (vertex more than {corner_fill_max_radius} px from any "
+                f"populated cell) -- consider raising corner_fill_max_radius"
+            )
+
         if len(records) == 0:
             return gpd.GeoDataFrame(
                 columns=[
@@ -572,6 +687,34 @@ class SWOTIntertidalPipeline:
             )
 
         return gpd.GeoDataFrame(records, geometry="geometry", crs="EPSG:4326")
+
+    def _fill_grid_nearest(self, lon_grid, lat_grid, max_radius=3):
+        """Fill NaN cells in lon_grid/lat_grid with the value of the
+        nearest populated (non-NaN) cell, but only up to `max_radius`
+        pixels away. Cells with no populated cell within that radius are
+        left as NaN. Returns (lon_filled, lat_filled, n_filled).
+        """
+        populated = np.isfinite(lon_grid) & np.isfinite(lat_grid)
+
+        if populated.all() or max_radius <= 0:
+            return lon_grid, lat_grid, 0
+
+        # distance (in pixels) and index of the nearest populated cell,
+        # for every cell in the grid
+        dist, (nearest_r, nearest_c) = distance_transform_edt(
+            ~populated, return_distances=True, return_indices=True
+        )
+
+        fillable = (~populated) & (dist <= max_radius)
+        n_filled = int(fillable.sum())
+        if n_filled == 0:
+            return lon_grid, lat_grid, 0
+
+        lon_filled = lon_grid.copy()
+        lat_filled = lat_grid.copy()
+        lon_filled[fillable] = lon_grid[nearest_r[fillable], nearest_c[fillable]]
+        lat_filled[fillable] = lat_grid[nearest_r[fillable], nearest_c[fillable]]
+        return lon_filled, lat_filled, n_filled
 
     def _pixel_polygon_to_lonlat(self, pixel_polygon, lon_grid, lat_grid):
         """Remap a Polygon/MultiPolygon whose coordinates are (col, row)
@@ -585,11 +728,11 @@ class SWOTIntertidalPipeline:
         polys = [pixel_polygon] if pixel_polygon.geom_type == "Polygon" else list(pixel_polygon.geoms)
 
         out_polys = []
+        n_dropped = 0
         for poly in polys:
             exterior = convert_ring(poly.exterior.coords)
             if any(p is None for p in exterior):
-                # a corner fell entirely outside the populated swath grid;
-                # drop this piece rather than build a polygon with a gap
+                n_dropped += 1
                 continue
 
             interiors, skip = [], False
@@ -600,25 +743,25 @@ class SWOTIntertidalPipeline:
                     break
                 interiors.append(conv)
             if skip:
+                n_dropped += 1
                 continue
 
             new_poly = Polygon(exterior, interiors)
             if not new_poly.is_valid:
                 new_poly = new_poly.buffer(0)
-                if isinstance(new_poly, MultiPolygon):
-                    new_poly = max(new_poly.geoms, key=lambda p: p.area)
             if not new_poly.is_empty:
-                out_polys.append(new_poly)
+                if isinstance(new_poly, MultiPolygon):
+                    out_polys.extend(g for g in new_poly.geoms if not g.is_empty)
+                else:
+                    out_polys.append(new_poly)
 
         if not out_polys:
-            return None
+            return None, n_dropped
         if len(out_polys) == 1:
-            return out_polys[0]
+            return out_polys[0], n_dropped
 
         merged = unary_union(out_polys)
-        if isinstance(merged, MultiPolygon):
-            merged = max(merged.geoms, key=lambda p: p.area)
-        return merged
+        return merged, n_dropped
 
     def _pixel_corner_to_lonlat(self, x, y, lon_grid, lat_grid):
         """Average the lon/lat of the (up to 4) grid cells touching
@@ -830,8 +973,6 @@ class SWOTIntertidalPipeline:
         enabled = self.cfg.exclude_dark_water if enabled is None else enabled
         if not enabled:
             return pixc_df
-        # index preserved (not reset) so any mask computed against pixc_df
-        # before/after this call stays aligned to the same row labels.
         return pixc_df[~pixc_df["classification"].isin(
             self._dark_water_class_codes())]
 
@@ -1036,7 +1177,6 @@ class SWOTIntertidalPipeline:
         n_az = az_max - az_min + 1
         n_rg = rg_max - rg_min + 1
 
-        # confidently-classified land pixels
         land = (
             (classification == self.cfg.land_class_code)
             & (arrays["classification_qual"] == 0)
@@ -1048,7 +1188,6 @@ class SWOTIntertidalPipeline:
         populated = np.zeros((n_az, n_rg), dtype=bool)
         populated[az - az_min, rg - rg_min] = True
 
-        # clean up the land mask
         BW = land_grid | ~populated
         se = disk(self.cfg.land_closing_disk_radius)
         BW1 = remove_small_objects(
@@ -1363,7 +1502,6 @@ class SWOTIntertidalPipeline:
         if coast_gdf.crs is None:
             coast_gdf = coast_gdf.set_crs("EPSG:4326")
 
-        # project to a metric CRS so the buffer distance is in real km
         coast_proj = coast_gdf.to_crs(projected_crs)
 
         buffer_m = buffer_km * 1000.0
@@ -1514,6 +1652,93 @@ class SWOTIntertidalPipeline:
         category[water_pixel] = 1
         category[intertidal_pixel] = 2
         return category
+
+    def _scatter_mask_panel(self, ax, base_df: pd.DataFrame, mask, *,
+                             title: Optional[str] = None,
+                             xlim: Optional[tuple] = None,
+                             ylim: Optional[tuple] = None,
+                             aspect: Optional[float] = None):
+        """Shared lon/lat scatter styling for a boolean pixel mask (kept =
+        darkorange vs. dropped = lightgray). Used by both `plot_mask_step`
+        (single-panel) and `plot_pipeline_summary_grid` (2x2 combined) so
+        every mask panel in the pipeline looks exactly the same.
+        """
+        mask_arr = mask.to_numpy() if isinstance(mask, pd.Series) else np.asarray(mask)
+        if isinstance(mask, pd.Series):
+            mask_arr = mask.reindex(base_df.index, fill_value=False).to_numpy()
+        elif len(mask_arr) != len(base_df):
+            raise ValueError(
+                f"mask length ({len(mask_arr)}) does not match base_df length "
+                f"({len(base_df)}); pass mask as a pandas Series sharing "
+                "base_df's index if lengths legitimately differ."
+            )
+
+        lon = base_df["longitude"].to_numpy()
+        lat = base_df["latitude"].to_numpy()
+        colors = np.where(mask_arr, "darkorange", "lightgray")
+        ax.scatter(lon, lat, c=colors, s=2)
+        ax.set_xlabel("Longitude")
+        ax.set_ylabel("Latitude")
+
+        if aspect is None:
+            mean_lat = np.deg2rad(np.nanmean(lat)) if lat.size else 0.0
+            aspect = 1 / np.cos(mean_lat)
+        if np.isfinite(aspect) and aspect > 0:
+            ax.set_aspect(aspect)
+
+        n_kept = int(np.sum(mask_arr))
+        if title is not None:
+            ax.set_title(f"{title}\n({n_kept}/{len(mask_arr)} kept)")
+        if xlim is not None:
+            ax.set_xlim(xlim)
+        if ylim is not None:
+            ax.set_ylim(ylim)
+        return n_kept
+
+    def _scatter_value_panel(self, ax, data: pd.DataFrame, value_col: Optional[str], *,
+                              lon_col: str = "longitude", lat_col: str = "latitude",
+                              cmap: str = "viridis", vmin: Optional[float] = None,
+                              vmax: Optional[float] = None, title: Optional[str] = None,
+                              xlim: Optional[tuple] = None, ylim: Optional[tuple] = None,
+                              aspect: Optional[float] = None,
+                              inset_colorbar: bool = False):
+        """Shared lon/lat scatter styling for pixels optionally colored by a
+        value column (e.g. h_a), with a colorbar when a value_col is given.
+        Used by both `plot_step`'s DataFrame branch (single-panel) and
+        `plot_pipeline_summary_grid` (2x2 combined) so every value panel in
+        the pipeline looks exactly the same.
+        """
+        lon = data[lon_col].to_numpy()
+        lat = data[lat_col].to_numpy()
+        c = data[value_col].to_numpy() if value_col and value_col in data.columns else None
+        sc = ax.scatter(lon, lat, c=c, s=2, cmap=cmap, vmin=vmin, vmax=vmax)
+        if c is not None:
+            if inset_colorbar:
+                cax = inset_axes(
+                    ax, width="4%", height="100%", loc="center left",
+                    bbox_to_anchor=(1.02, 0.0, 1, 1),
+                    bbox_transform=ax.transAxes, borderpad=0,
+                )
+                cbar = plt.colorbar(sc, cax=cax)
+            else:
+                cbar = plt.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
+            cbar.set_label(value_col)
+        ax.set_xlabel("Longitude")
+        ax.set_ylabel("Latitude")
+
+        if aspect is None:
+            mean_lat = np.deg2rad(np.nanmean(lat))
+            aspect = 1 / np.cos(mean_lat)
+        if np.isfinite(aspect) and aspect > 0:
+            ax.set_aspect(aspect)
+
+        if title is not None:
+            ax.set_title(title)
+        if xlim is not None:
+            ax.set_xlim(xlim)
+        if ylim is not None:
+            ax.set_ylim(ylim)
+        return sc
     
     def plot_step(self, data, step_name: str, output_dir: str, *,
                   value_col: Optional[str] = None, title: Optional[str] = None,
@@ -1568,21 +1793,10 @@ class SWOTIntertidalPipeline:
                 lon_col = next((c for c in lon_aliases if c in data.columns), None)
                 lat_col = next((c for c in lat_aliases if c in data.columns), None)
                 if lon_col and lat_col and len(data) > 0:
-                    lon = data[lon_col].to_numpy()
-                    lat = data[lat_col].to_numpy()
-                    c = None
-                    if value_col and value_col in data.columns:
-                        c = data[value_col].to_numpy()
-                    sc = ax.scatter(lon, lat, c=c, s=2, cmap=cmap, vmin=vmin, vmax=vmax)
-                    if c is not None:
-                        cbar = plt.colorbar(sc, ax=ax)
-                        cbar.set_label(value_col)
-                    ax.set_xlabel("Longitude")
-                    ax.set_ylabel("Latitude")
-                    mean_lat = np.deg2rad(np.nanmean(lat))
-                    aspect = 1 / np.cos(mean_lat)
-                    if np.isfinite(aspect) and aspect > 0:
-                        ax.set_aspect(aspect)
+                    self._scatter_value_panel(
+                        ax, data, value_col, lon_col=lon_col, lat_col=lat_col,
+                        cmap=cmap, vmin=vmin, vmax=vmax,
+                    )
                     made_plot = True
                 elif value_col and value_col in data.columns and len(data) > 0:
                     ax.hist(data[value_col].to_numpy(), bins=3000, color="steelblue")
@@ -1624,6 +1838,8 @@ class SWOTIntertidalPipeline:
 
             if xlim is not None:
                 ax.set_xlim(xlim)
+            if ylim is not None:
+                ax.set_ylim(ylim)
 
             ax.set_title(plot_title)
             plt.tight_layout()
@@ -1640,40 +1856,85 @@ class SWOTIntertidalPipeline:
 
     def plot_mask_step(self, base_df: pd.DataFrame, mask, step_name: str,
                         output_dir: str, *, title: Optional[str] = None,
-                        dpi: int = 150, show: bool = False):
+                        dpi: int = 150, show: bool = False,
+                        xlim: Optional[tuple] = None, ylim: Optional[tuple] = None):
         """Scatter-plot a boolean pixel mask (kept vs. dropped) over the
         lon/lat of `base_df`.
         """
-        mask_arr = mask.to_numpy() if isinstance(mask, pd.Series) else np.asarray(mask)
-
-        if isinstance(mask, pd.Series):
-            mask_arr = mask.reindex(base_df.index, fill_value=False).to_numpy()
-        elif len(mask_arr) != len(base_df):
-            raise ValueError(
-                f"plot_mask_step: mask length ({len(mask_arr)}) does not match "
-                f"base_df length ({len(base_df)}); pass mask as a pandas Series "
-                "sharing base_df's index if lengths legitimately differ."
-            )
-
-        lon = base_df["longitude"].to_numpy()
-        lat = base_df["latitude"].to_numpy()
-
         fig, ax = plt.subplots(figsize=(8, 8))
         try:
-            colors = np.where(mask_arr, "darkorange", "lightgray")
-            ax.scatter(lon, lat, c=colors, s=2)
-            ax.set_xlabel("Longitude")
-            ax.set_ylabel("Latitude")
-
-            mean_lat = np.deg2rad(np.nanmean(lat)) if lat.size else 0.0
-            aspect = 1 / np.cos(mean_lat)
-            if np.isfinite(aspect) and aspect > 0:
-                ax.set_aspect(aspect)
-
-            n_kept = int(np.sum(mask_arr))
             plot_title = title or step_name.replace("_", " ").title()
-            ax.set_title(f"{plot_title}\n({n_kept}/{len(mask_arr)} kept)")
+            self._scatter_mask_panel(ax, base_df, mask, title=plot_title, xlim=xlim, ylim=ylim)
             plt.tight_layout()
+
+            path = os.path.join(output_dir, f"{step_name}.png")
+            fig.savefig(path, dpi=dpi)
+            print(f"Saved step plot: {path}")
+
+            if show:
+                plt.show()
+            return path
+        finally:
+            plt.close(fig)
+
+    def plot_pipeline_summary_grid(
+        self,
+        pixc_full: pd.DataFrame,
+        subset_mask,
+        pixc_ha: pd.DataFrame,
+        phase_noise_mask,
+        open_water_mask,
+        step_name: str,
+        output_dir: str,
+        *,
+        value_col: str = "h_a",
+        cmap: str = "viridis",
+        vmin: Optional[float] = None,
+        vmax: Optional[float] = None,
+        xlim: Optional[tuple] = None,
+        ylim: Optional[tuple] = None,
+        dpi: int = 150,
+        show: bool = False,
+    ):
+        """Combined 2x2 lon/lat diagnostic figure:
+
+            top-left     = subset-by-kml mask
+            top-right    = phase-noise filtered mask
+            bottom-left  = open-water filtered mask
+            bottom-right = height anomaly (h_a)
+        """
+        fig, axes = plt.subplots(2, 2, figsize=(14, 14), constrained_layout=True)
+        ax_tl, ax_tr = axes[0, 0], axes[0, 1]
+        ax_bl, ax_br = axes[1, 0], axes[1, 1]
+
+        full_lat = pixc_full["latitude"].to_numpy()
+        mean_lat = np.deg2rad(np.nanmean(full_lat)) if full_lat.size else 0.0
+        shared_aspect = 1 / np.cos(mean_lat)
+        if not (np.isfinite(shared_aspect) and shared_aspect > 0):
+            shared_aspect = None
+
+        try:
+            self._scatter_mask_panel(
+                ax_tl, pixc_full, subset_mask,
+                title="(1) Subset by kml", xlim=xlim, ylim=ylim,
+                aspect=shared_aspect,
+            )
+            self._scatter_mask_panel(
+                ax_tr, pixc_full, phase_noise_mask,
+                title="(2) Phase-Noise Filtered Pixels", xlim=xlim, ylim=ylim,
+                aspect=shared_aspect,
+            )
+            self._scatter_mask_panel(
+                ax_bl, pixc_full, open_water_mask,
+                title="(4) Open-Water Filtered Candidates", xlim=xlim, ylim=ylim,
+                aspect=shared_aspect,
+            )
+            self._scatter_value_panel(
+                ax_br, pixc_ha, value_col,
+                cmap=cmap, vmin=vmin, vmax=vmax,
+                title="(3) Height Anomaly (h_a)", xlim=xlim, ylim=ylim,
+                aspect=shared_aspect, inset_colorbar=True,
+            )
 
             path = os.path.join(output_dir, f"{step_name}.png")
             fig.savefig(path, dpi=dpi)
