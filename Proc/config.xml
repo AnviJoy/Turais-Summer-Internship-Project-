@@ -158,6 +158,14 @@
             <value type="str">geoloc_qual</value>
             <value type="str">geo_qual</value>
         </alias>
+        <alias key="interferogram_qual">
+            <value type="str">interferogram_qual</value>
+            <value type="str">intf_qual</value>
+        </alias>
+        <alias key="sig0_qual">
+            <value type="str">sig0_qual</value>
+            <value type="str">sigma0_qual</value>
+        </alias>
         <alias key="classification">
             <value type="str">classification</value>
             <value type="str">classification_flag</value>
@@ -202,7 +210,7 @@
     <!-- File paths -->
     <paths>
         <!-- subset = r"C:\Users\pmalesza\Documents\SWOT kml\subset.kml" (commented out in original) -->
-        <subset type="str">/data/Turais/DATA/Kmls/Heysham_big_subset.kml</subset>
+        <subset type="str">/data/Turais/DATA/Kmls/kirby_subset.kml</subset>
 
         <!-- UK coastline reference line (KML), used to build a coastal buffer mask -->
         <!-- alt: C:\Users\pmalesza\Documents\SWOT kml\UK_coastline_500m_accuracy.kml -->
