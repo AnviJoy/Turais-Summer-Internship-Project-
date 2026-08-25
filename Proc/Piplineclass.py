@@ -418,11 +418,21 @@ class SWOTIntertidalPipeline:
         validity_quantile = validity_quantile if validity_quantile is not None \
             else self.cfg.mask_validity_quantile
 
-        mask_series = open_water_mask if isinstance(open_water_mask, pd.Series) \
-            else pd.Series(np.asarray(open_water_mask), index=range(len(open_water_mask)))
+        if isinstance(open_water_mask, (list, tuple)):
+            # one mask per cycle
+            if len(open_water_mask) != len(per_cycle_filtered_pixc):
+                raise ValueError(
+                    f"build_water_extent_mask: got {len(open_water_mask)} masks for "
+                    f"{len(per_cycle_filtered_pixc)} per-cycle dataframes; need one mask per cycle."
+                )
+            masks = open_water_mask
+        else:
+            masks = [open_water_mask] * len(per_cycle_filtered_pixc)
+
         per_cycle_filtered_pixc = [
-            df[mask_series.reindex(df.index, fill_value=False)]
-            for df in per_cycle_filtered_pixc
+            df[(mask if isinstance(mask, pd.Series)
+                else pd.Series(np.asarray(mask), index=range(len(mask)))).reindex(df.index, fill_value=False)]
+            for df, mask in zip(per_cycle_filtered_pixc, masks)
         ]
 
         all_lat = np.concatenate([df["latitude"].to_numpy() for df in per_cycle_filtered_pixc])
@@ -498,33 +508,6 @@ class SWOTIntertidalPipeline:
         # self._water_extent_mask = cleaned
         # return cleaned
 
-    def water_extent_gdf(self, water_extent_mask) -> gpd.GeoDataFrame:
-        """Wrap the water_extent_mask (Multi)Polygon into a per-piece
-        GeoDataFrame -- one row per disconnected piece -- mirroring the row
-        structure of `polygons_from_raster_mask` so `water` can be exported
-        and plotted the same way `intertidal` is, via
-        `export_polygons_shapefile`, `export_polygons_kml`, and
-        `plot_category_polygons`. No pieces are dropped here.
-        """
-        geoms = list(water_extent_mask.geoms) if water_extent_mask.geom_type == "MultiPolygon" \
-            else [water_extent_mask]
-
-        records = []
-        for region_id, geom in enumerate(geoms, start=1):
-            if geom is None or geom.is_empty:
-                continue
-            centroid = geom.centroid
-            records.append({
-                "category": "water",
-                "region_id": region_id,
-                "area": geom.area,
-                "cent_lon": centroid.x,
-                "cent_lat": centroid.y,
-                "geometry": geom,
-            })
-
-        return gpd.GeoDataFrame(records, geometry="geometry", crs="EPSG:4326")
-    
     def polygons_from_binary_mask(
         self,
         binary_mask,
@@ -818,7 +801,6 @@ class SWOTIntertidalPipeline:
                     if isinstance(repaired, MultiPolygon):
                         repaired = max(repaired.geoms, key=lambda p: p.area)
                     cleaned = repaired
-                # else: keep the pre-smoothing `cleaned` polygon as a fallback
 
         if not cleaned.is_valid:
             cleaned = cleaned.buffer(0)
@@ -1110,19 +1092,26 @@ class SWOTIntertidalPipeline:
         """Run the full pipeline across cycles and return intermediate and final products."""
         per_cycle_filtered = {}
         per_cycle_intertidal = {}
+        per_cycle_open_water_mask = {}
 
         for cycle, fp in filepaths_by_cycle.items():
             pixc = self.read_pixel_cloud(fp, cycle=cycle, bbox=bbox)
             pixc = self.compute_height_anomaly(pixc, ref_lat=ref_lat, ref_lon=ref_lon)
             self.check_reference_point_classification(pixc)
             pixc = self.filter_dark_water(pixc)
-            filtered = self.filter_phase_noise(pixc)
+
+            initial_mask = pd.Series(True, index=pixc.index)
+            filtered, phase_noise_mask = self.filter_phase_noise(initial_mask, pixc)
             per_cycle_filtered[cycle] = filtered
 
-            candidates = self.filter_open_water(filtered)
+            candidates, open_water_mask = self.filter_open_water(filtered, phase_noise_mask)
             per_cycle_intertidal[cycle] = candidates
+            per_cycle_open_water_mask[cycle] = open_water_mask
 
-        mask = self.build_water_extent_mask(list(per_cycle_filtered.values()))
+        mask = self.build_water_extent_mask(
+            list(per_cycle_open_water_mask.values()),
+            list(per_cycle_filtered.values()),
+        )
 
         final_intertidal = {}
         for cycle, candidates in per_cycle_intertidal.items():
@@ -1199,7 +1188,6 @@ class SWOTIntertidalPipeline:
 
         not_land_clean = ~BW3
 
-        # a pixel only counts as "good quality" if every configured flag reads 0
         quality = np.ones(classification.shape, dtype=bool)
         for qual_name in self.cfg.quality_flag_names:
             quality &= (arrays[qual_name] == 0)
@@ -1898,10 +1886,10 @@ class SWOTIntertidalPipeline:
     ):
         """Combined 2x2 lon/lat diagnostic figure:
 
-            top-left     = subset-by-kml mask
-            top-right    = phase-noise filtered mask
-            bottom-left  = open-water filtered mask
-            bottom-right = height anomaly (h_a)
+            top-left     = Step 1b subset-by-kml mask
+            top-right    = Step 3 phase-noise filtered mask
+            bottom-left  = Step 4 open-water filtered mask
+            bottom-right = Step 2 height anomaly (h_a)
         """
         fig, axes = plt.subplots(2, 2, figsize=(14, 14), constrained_layout=True)
         ax_tl, ax_tr = axes[0, 0], axes[0, 1]
@@ -1984,12 +1972,7 @@ class SWOTIntertidalPipeline:
 
     def plot_category_polygons(self, category_gdfs: dict, ax=None,
                                 colors: Optional[dict] = None):
-        """Plot polygon boundaries for one or more categories on the same axes.
-
-        `category_gdfs` maps category name -> GeoDataFrame, e.g.
-        {"water": water_gdf, "intertidal": intertidal_gdf}. Empty/None
-        GeoDataFrames are skipped (an empty GeoDataFrame passed to
-        .plot() raises "aspect must be finite and positive")."""
+        """Plot polygon boundaries for one or more categories on the same axes."""
         default_colors = {"water": "blue", "intertidal": "red", "land": "green"}
         colors = colors or default_colors
 
