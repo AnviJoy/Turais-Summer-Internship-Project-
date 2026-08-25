@@ -66,13 +66,7 @@ def _step_timer():
 
 
 def _plot_peak_diagnostic(pipe, candidates, filtered, output_dir, show_plots=False, silent=False):
-    """Step 4 KDE peak diagnostic plot (same logic as peak.py).
-
-    Plots the h_a KDE, all peaks that cleared pdf_peak_min_density, the
-    single peak_idx that filter_open_water actually used, and the
-    [h_a_lower, h_a_upper] candidate band. Saved to output_dir; only shown
-    interactively if show_plots is True.
-    """
+    """Step 4 KDE peak diagnostic plot """
     grid = candidates.attrs["grid"]
     pdf = candidates.attrs["pdf"]
     peak_idx = candidates.attrs["peak_idx"]
@@ -247,16 +241,7 @@ def run_polygon_pipeline(pipe: SWOTIntertidalPipeline, config, filepaths, output
 
         _t = _step_timer()
         water_extent_mask = pipe.build_water_extent_mask(open_water_mask, [filtered])
-
-        #water_gdf = pipe.water_extent_gdf(water_extent_mask)
-        #shapefile_paths = {}
-        #if not silent:
-            #print(f"Step 5a - water_extent_gdf: {len(water_gdf)} water polygon(s)")
-        #if len(water_gdf) == 0:
-            #print("No water polygons found.")
-        #else:
-            #shapefile_paths["water"] = pipe.export_polygons_shapefile(water_gdf, "water", output_dir)
-            #pipe.export_polygons_kml(water_gdf, "water", output_dir)
+        shapefile_paths = {}
 
         if water_extent_mask.geom_type == "MultiPolygon":
             piece_areas = [poly.area for poly in water_extent_mask.geoms]
@@ -338,25 +323,40 @@ def run_polygon_pipeline(pipe: SWOTIntertidalPipeline, config, filepaths, output
             _t("gridify (lon/lat)")
 
         _t = _step_timer()
+        water_mask = subset_mask & pixc_full["classification"].isin(config.water_class_codes).to_numpy()
+        if exclude_land:
+            water_mask &= (pixc_full["classification"] != config.land_class_code).to_numpy()
+        if config.exclude_dark_water:
+            water_mask &= ~pixc_full["classification"].isin(config.dark_water_class_codes).to_numpy()
+
+        water_grid = pipe.gridify(pixc_full["azimuth_index"], pixc_full["range_index"], water_mask)
+        water_gdf = pipe.polygons_from_raster_mask(
+            water_grid, lon_grid, lat_grid, category="water",
+            fill_holes=not exclude_land,
+            output_dir=output_dir if build_plots else None,
+            show=show_plots,
+        )
+        if not silent:
+            _t("polygons_from_raster_mask (water)")
+            print(f"Step 6a - polygons_from_raster_mask: {len(water_gdf)} water polygon(s)")
+        if len(water_gdf) == 0:
+            print("No water polygons found.")
+        else:
+            shapefile_paths["water"] = pipe.export_polygons_shapefile(water_gdf, "water", output_dir)
+            pipe.export_polygons_kml(water_gdf, "water", output_dir)
+
+        _t = _step_timer()
         intertidal_gdf = pipe.polygons_from_raster_mask(
             grid, lon_grid, lat_grid, category="intertidal",
             fill_holes=not exclude_land,
             output_dir=output_dir if build_plots else None,
             show=show_plots,
         )
-
-        # water_gdf = pipe.polygons_from_raster_mask(
-        #     grid, lon_grid, lat_grid, category="water",
-        #     fill_holes=not exclude_land,
-        #     output_dir=output_dir if build_plots else None,
-        #     show=show_plots,
-        # )
-
         if not silent:
-            _t("polygons_from_raster_mask")
-            print(f"Step 6 - polygons_from_raster_mask: {len(intertidal_gdf)} intertidal polygon(s)")
+            _t("polygons_from_raster_mask (intertidal)")
+            print(f"Step 6b - polygons_from_raster_mask: {len(intertidal_gdf)} intertidal polygon(s)")
 
-        if not silent and len(intertidal_gdf) > 0 or len(water_gdf) > 0:
+        if not silent and len(intertidal_gdf) > 0:
             _areas_sorted = intertidal_gdf["area"].sort_values()
             _pcts = [10, 25, 50, 75, 90, 95, 99]
             _pct_str = ", ".join(
@@ -367,19 +367,13 @@ def run_polygon_pipeline(pipe: SWOTIntertidalPipeline, config, filepaths, output
                 f"min={intertidal_gdf['area'].min():.3e}, {_pct_str}, "
                 f"max={intertidal_gdf['area'].max():.3e}"
             )
-            # print(
-            #     "    water_gdf area (deg^2) stats: "  
-            #     f"min={water_gdf['area'].min():.3e}, {_pct_str}, "
-            #     f"max={water_gdf['area'].max():.3e}"
-            # )      
 
-        shapefile_paths = {}
         n_before = len(intertidal_gdf)
         intertidal_gdf = pipe.remove_small_polygons(
             intertidal_gdf, min_area=config.min_intertidal_polygon_area, area_col="area",
         )
         if not silent:
-            print(f"Step 6b - remove_small_polygons: kept {len(intertidal_gdf)} / {n_before} "
+            print(f"Step 6c - remove_small_polygons: kept {len(intertidal_gdf)} / {n_before} "
                   f"intertidal polygon(s) (min_area={config.min_intertidal_polygon_area} deg^2)")
 
         if len(intertidal_gdf) == 0:
@@ -387,20 +381,6 @@ def run_polygon_pipeline(pipe: SWOTIntertidalPipeline, config, filepaths, output
         else:
             shapefile_paths["intertidal"] = pipe.export_polygons_shapefile(intertidal_gdf, "intertidal", output_dir)
             pipe.export_polygons_kml(intertidal_gdf, "intertidal", output_dir)
-
-        # n_before = len(water_gdf)
-        # water_gdf = pipe.remove_small_polygons(
-        #     water_gdf, min_area=config.min_intertidal_polygon_area, area_col="area",
-        # )           
-        # if not silent:
-        #     print(f"Step 6b - remove_small_polygons: kept {len(water_gdf)} / {n_before} "
-        #           f"water polygon(s) (min_area={config.min_intertidal_polygon_area} deg^2)")
-
-        # if len(water_gdf) == 0:
-        #     print("No water polygons found.")   
-        # else:
-        #     shapefile_paths["water"] = pipe.export_polygons_shapefile(water_gdf, "water", output_dir)
-        #     pipe.export_polygons_kml(water_gdf, "water", output_dir)
 
         _t = _step_timer()
         agg_grid = pipe.aggregate_to_grid(intertidal_pixels)
@@ -410,17 +390,9 @@ def run_polygon_pipeline(pipe: SWOTIntertidalPipeline, config, filepaths, output
             print(f"Wrote gridded output to {grid_csv}")
             _t(f"aggregate_to_grid ({len(agg_grid)} cells x {config.mc_realizations} MC realizations)")
 
-        # agg_grid = pipe.aggregate_to_grid(water_gdf)
-        # grid_csv = os.path.join(output_dir, "water_grid.csv")
-        # agg_grid.to_csv(grid_csv, index=False)
-        # if not silent:
-        #     print(f"Wrote gridded output to {grid_csv}")
-        #     _t(f"aggregate_to_grid ({len(agg_grid)} cells x {config.mc_realizations} MC realizations)")
-
         if len(intertidal_gdf) > 0 or len(water_gdf) > 0:
             _t = _step_timer()
-            #ax1 = pipe.plot_category_polygons({"water": water_gdf, "intertidal": intertidal_gdf})
-            ax1 = pipe.plot_category_polygons({"intertidal": intertidal_gdf})
+            ax1 = pipe.plot_category_polygons({"water": water_gdf, "intertidal": intertidal_gdf})
             polygons_png = os.path.join(output_dir, "category_polygons.png")
             ax1.figure.savefig(polygons_png, dpi=150)
             if not silent:
@@ -454,7 +426,7 @@ def run_polygon_pipeline(pipe: SWOTIntertidalPipeline, config, filepaths, output
         results[filepath] = {
             "output_dir": output_dir,
             "intertidal_gdf": intertidal_gdf,
-            #"water_gdf": water_gdf,
+            "water_gdf": water_gdf,
             "shapefile_paths": shapefile_paths,
             "grid_csv": grid_csv,
         }
