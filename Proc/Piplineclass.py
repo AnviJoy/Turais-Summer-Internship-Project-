@@ -488,7 +488,6 @@ class SWOTIntertidalPipeline:
         else:
             merged = unary_union(polygons.values)
 
-        # Clean the merged geometry but keep all disconnected polygons
         if isinstance(merged, MultiPolygon):
             cleaned = MultiPolygon(
                 [self._clean_polygon(poly) for poly in merged.geoms]
@@ -811,8 +810,7 @@ class SWOTIntertidalPipeline:
 
     def apply_water_extent_mask(self, candidates_df: pd.DataFrame,
                                  mask_polygon=None, base_mask=None) -> pd.DataFrame:
-        """Keep only candidate pixels that fall inside the water extent mask.
-        """
+        """Keep only candidate pixels that fall inside the water extent mask."""
         mask_polygon = mask_polygon or self._water_extent_mask
         if mask_polygon is None:
             raise ValueError("No water_extent_mask provided or cached; "
@@ -1645,7 +1643,8 @@ class SWOTIntertidalPipeline:
                              title: Optional[str] = None,
                              xlim: Optional[tuple] = None,
                              ylim: Optional[tuple] = None,
-                             aspect: Optional[float] = None):
+                             aspect: Optional[float] = None,
+                             fontsize: Optional[int] = None):
         """Shared lon/lat scatter styling for a boolean pixel mask (kept =
         darkorange vs. dropped = lightgray). Used by both `plot_mask_step`
         (single-panel) and `plot_pipeline_summary_grid` (2x2 combined) so
@@ -1665,18 +1664,21 @@ class SWOTIntertidalPipeline:
         lat = base_df["latitude"].to_numpy()
         colors = np.where(mask_arr, "darkorange", "lightgray")
         ax.scatter(lon, lat, c=colors, s=2)
-        ax.set_xlabel("Longitude")
-        ax.set_ylabel("Latitude")
+        ax.set_xlabel("Longitude", fontsize=fontsize)
+        ax.set_ylabel("Latitude", fontsize=fontsize)
+        if fontsize is not None:
+            ax.tick_params(axis="both", labelsize=fontsize)
 
         if aspect is None:
             mean_lat = np.deg2rad(np.nanmean(lat)) if lat.size else 0.0
             aspect = 1 / np.cos(mean_lat)
         if np.isfinite(aspect) and aspect > 0:
-            ax.set_aspect(aspect)
+            ax.set_aspect(aspect, adjustable="datalim")
+        ax.set_box_aspect(1)
 
         n_kept = int(np.sum(mask_arr))
         if title is not None:
-            ax.set_title(f"{title}\n({n_kept}/{len(mask_arr)} kept)")
+            ax.set_title(f"{title}\n({n_kept}/{len(mask_arr)} kept)", fontsize=fontsize)
         if xlim is not None:
             ax.set_xlim(xlim)
         if ylim is not None:
@@ -1689,7 +1691,8 @@ class SWOTIntertidalPipeline:
                               vmax: Optional[float] = None, title: Optional[str] = None,
                               xlim: Optional[tuple] = None, ylim: Optional[tuple] = None,
                               aspect: Optional[float] = None,
-                              inset_colorbar: bool = False):
+                              inset_colorbar: bool = False,
+                              fontsize: Optional[int] = None):
         """Shared lon/lat scatter styling for pixels optionally colored by a
         value column (e.g. h_a), with a colorbar when a value_col is given.
         Used by both `plot_step`'s DataFrame branch (single-panel) and
@@ -1710,18 +1713,23 @@ class SWOTIntertidalPipeline:
                 cbar = plt.colorbar(sc, cax=cax)
             else:
                 cbar = plt.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
-            cbar.set_label(value_col)
-        ax.set_xlabel("Longitude")
-        ax.set_ylabel("Latitude")
+            cbar.set_label(value_col, fontsize=fontsize)
+            if fontsize is not None:
+                cbar.ax.tick_params(labelsize=fontsize)
+        ax.set_xlabel("Longitude", fontsize=fontsize)
+        ax.set_ylabel("Latitude", fontsize=fontsize)
+        if fontsize is not None:
+            ax.tick_params(axis="both", labelsize=fontsize)
 
         if aspect is None:
             mean_lat = np.deg2rad(np.nanmean(lat))
             aspect = 1 / np.cos(mean_lat)
         if np.isfinite(aspect) and aspect > 0:
-            ax.set_aspect(aspect)
+            ax.set_aspect(aspect, adjustable="datalim")
+        ax.set_box_aspect(1)
 
         if title is not None:
-            ax.set_title(title)
+            ax.set_title(title, fontsize=fontsize)
         if xlim is not None:
             ax.set_xlim(xlim)
         if ylim is not None:
@@ -1877,6 +1885,7 @@ class SWOTIntertidalPipeline:
         *,
         value_col: str = "h_a",
         cmap: str = "viridis",
+        fontsize: Optional[int] = None,
         vmin: Optional[float] = None,
         vmax: Optional[float] = None,
         xlim: Optional[tuple] = None,
@@ -1888,8 +1897,8 @@ class SWOTIntertidalPipeline:
 
             top-left     = Step 1b subset-by-kml mask
             top-right    = Step 3 phase-noise filtered mask
-            bottom-left  = Step 4 open-water filtered mask
-            bottom-right = Step 2 height anomaly (h_a)
+            bottom-left  = Step 2 height anomaly (h_a)
+            bottom-right = Step 4 open-water filtered mask
         """
         fig, axes = plt.subplots(2, 2, figsize=(14, 14), constrained_layout=True)
         ax_tl, ax_tr = axes[0, 0], axes[0, 1]
@@ -1900,28 +1909,34 @@ class SWOTIntertidalPipeline:
         shared_aspect = 1 / np.cos(mean_lat)
         if not (np.isfinite(shared_aspect) and shared_aspect > 0):
             shared_aspect = None
+            
+        if xlim is not None and ylim is not None and shared_aspect:
+            x_center = (xlim[0] + xlim[1]) / 2.0
+            y_height = ylim[1] - ylim[0]
+            x_width = y_height * shared_aspect
+            xlim = (x_center - x_width / 2.0, x_center + x_width / 2.0)
 
         try:
             self._scatter_mask_panel(
                 ax_tl, pixc_full, subset_mask,
                 title="(1) Subset by kml", xlim=xlim, ylim=ylim,
-                aspect=shared_aspect,
+                aspect=shared_aspect, fontsize=fontsize,
             )
             self._scatter_mask_panel(
                 ax_tr, pixc_full, phase_noise_mask,
                 title="(2) Phase-Noise Filtered Pixels", xlim=xlim, ylim=ylim,
-                aspect=shared_aspect,
-            )
-            self._scatter_mask_panel(
-                ax_bl, pixc_full, open_water_mask,
-                title="(4) Open-Water Filtered Candidates", xlim=xlim, ylim=ylim,
-                aspect=shared_aspect,
+                aspect=shared_aspect, fontsize=fontsize,
             )
             self._scatter_value_panel(
-                ax_br, pixc_ha, value_col,
+                ax_bl, pixc_ha, value_col,
                 cmap=cmap, vmin=vmin, vmax=vmax,
                 title="(3) Height Anomaly (h_a)", xlim=xlim, ylim=ylim,
-                aspect=shared_aspect, inset_colorbar=True,
+                aspect=shared_aspect, inset_colorbar=False, fontsize=fontsize,
+            )
+            self._scatter_mask_panel(
+                ax_br, pixc_full, open_water_mask,
+                title="(4) Open-Water Filtered Candidates", xlim=xlim, ylim=ylim,
+                aspect=shared_aspect, fontsize=fontsize,
             )
 
             path = os.path.join(output_dir, f"{step_name}.png")
@@ -1998,8 +2013,7 @@ class SWOTIntertidalPipeline:
         return ax
 
     def make_output_directory(self, filepath: str, output_base: str) -> str:
-        """
-        Create an output directory based on the PIXC filename"""
+        """Create an output directory based on the PIXC filename"""
 
         stem = os.path.splitext(os.path.basename(filepath))[0]
         prefix = "SWOT_L2_HR_PIXC_"
