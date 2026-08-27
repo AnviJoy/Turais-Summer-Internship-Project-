@@ -233,7 +233,7 @@ def run_polygon_pipeline(pipe: SWOTIntertidalPipeline, config, filepaths, output
             pipe.plot_pipeline_summary_grid(
                 pixc_full, subset_mask, pixc, phase_noise_mask, open_water_mask,
                 "summary_2x2", output_dir,
-                xlim=(-3.4,-3), ylim=(53.2,53.45), vmin=-5, vmax=5, show=show_plots,
+                xlim=(-3.4,-3), ylim=(53.2,53.45), vmin=-3, vmax=3, show=show_plots, fontsize=20
             )
             if not silent:
                 _t("plot_pipeline_summary_grid")
